@@ -25,5 +25,6 @@
   "umami-software-umami",
   "zulip-zulip",
   "searxng-searxng",
-  "langfuse-langfuse"
+  "langfuse-langfuse",
+  "rss-bridge-rss-bridge"
 ]
