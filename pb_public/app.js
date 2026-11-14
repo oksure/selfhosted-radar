@@ -507,7 +507,7 @@ function bind() {
     const fd = new FormData(e.target);
     $('#auth-err').textContent = '';
     try {
-      const r = await fetch(API + '/users/auth-with-password', {
+      const r = await fetch(API + '/_superusers/auth-with-password', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identity: fd.get('email'), password: fd.get('password') }),
       });
