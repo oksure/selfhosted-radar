@@ -103,15 +103,24 @@ function filterString() {
   if (state.stars === 'lt500') parts.push('stars < 500');
   else if (state.stars === '500-5000') parts.push('stars >= 500 && stars < 5000');
   else if (state.stars === 'gt5000') parts.push('stars >= 5000');
+  if (state.preset === 'in-use') parts.push('unified_tags ~ "in-use"');
   if (state.preset === 'surge') parts.push('stars_7d_delta >= 20');  // history builds from day 1
   if (state.preset === 'release' && !state.q) parts.push('latest_release_at != ""');
   if (state.preset === 'new') {
     const d = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
     parts.push('first_seen_at >= ' + q_(d));
   }
-  if (state.auth && state.markFilter) {
+  const wantStarred = state.preset === 'starred' || state.markFilter === 'starred' || state.markFilter === 'marked';
+  if (wantStarred) {
+    if (!state.auth) return 'id = ""';
     const ids = Object.values(state.curation)
-      .filter(c => state.markFilter === 'marked' ? c.status && c.status !== 'dismissed' : c.status === state.markFilter)
+      .filter(c => c.status && c.status !== 'dismissed')
+      .map(c => c.project);
+    if (!ids.length) return 'id = ""';
+    parts.push('(' + ids.slice(0, 150).map(id => 'id = ' + q_(id)).join(' || ') + ')');
+  } else if (state.auth && state.markFilter) {
+    const ids = Object.values(state.curation)
+      .filter(c => c.status === state.markFilter)
       .map(c => c.project);
     if (!ids.length) return 'id = ""';
     parts.push('(' + ids.slice(0, 150).map(id => 'id = ' + q_(id)).join(' || ') + ')');
@@ -119,26 +128,28 @@ function filterString() {
   return parts.join(' && ');
 }
 
-const MARKS = [
-  ['watching', 'Watch'],
-  ['trying', 'Try'],
-  ['deployed', 'Use'],
-  ['dismissed', 'Skip'],
-];
+const isStarred = cur => Boolean(cur && cur.status && cur.status !== 'dismissed');
 
 function quickMarkBar(p) {
   if (!state.auth) return '';
-  const cur = state.curation[p.id];
-  const st = cur ? cur.status : '';
-  return `<div class="qmarks" data-pid="${esc(p.id)}">${MARKS.map(([val, label]) =>
-    `<button type="button" class="qmark-btn ${st === val ? 'is-on is-' + val : ''}" data-mark="${val}" title="${val}">${label}</button>`
-  ).join('')}</div>`;
+  const on = isStarred(state.curation[p.id]);
+  return `<div class="qmarks" data-pid="${esc(p.id)}"><button type="button" class="qmark-btn ${on ? 'is-on is-starred' : ''}" data-mark="watching" title="Starred">${on ? '★ Starred' : '☆ Star'}</button></div>`;
+}
+
+function cardLinks(p) {
+  const hp = safeUrl(p.homepage_url);
+  const rp = safeUrl(p.repo_url);
+  const out = [];
+  if (hp) out.push(`<a class="card-link" href="${esc(hp)}" target="_blank" rel="noopener noreferrer">Home ↗</a>`);
+  if (rp) out.push(`<a class="card-link" href="${esc(rp)}" target="_blank" rel="noopener noreferrer">${rp.includes('github.com') ? 'GitHub ↗' : 'Repo ↗'}</a>`);
+  return out.length ? `<div class="card-links">${out.join('')}</div>` : '<div></div>';
 }
 
 // ---------- renderers ----------
 function badgeFor(p) {
   const srcs = arr(p.sources);
   const out = [];
+  if (arr(p.unified_tags).includes('in-use')) out.push('<span class="badge use">in use</span>');
   if (srcs.includes('awesome') && srcs.includes('selfhst')) out.push('<span class="badge both">both</span>');
   else if (srcs.includes('awesome')) out.push('<span class="badge a">awesome</span>');
   else if (srcs.includes('selfhst')) out.push('<span class="badge s">selfh.st</span>');
@@ -150,10 +161,14 @@ function badgeFor(p) {
 
 function card(p) {
   const icon = safeUrl(p.icon_url);
-  const tags = arr(p.unified_tags).slice(0, 4).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+  const tags = arr(p.unified_tags)
+    .filter(t => t !== 'in-use')
+    .slice(0, 4)
+    .map(t => `<button type="button" class="tag tag-btn${state.tags.includes(t) ? ' is-on' : ''}" data-tag="${esc(t)}">${esc(t)}</button>`)
+    .join('');
   const d7 = Number(p.stars_7d_delta || 0);
   const cur = state.auth ? state.curation[p.id] : null;
-  const stCls = cur && cur.status ? ` is-mark-${cur.status}` : '';
+  const stCls = isStarred(cur) ? ' is-mark-watching' : '';
   return `<article class="card${stCls}" data-slug="${esc(p.slug)}" tabindex="0" role="button">
     <div class="card-top">
       ${icon ? `<img class="icon" src="${esc(icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="icon"></div>'}
@@ -169,16 +184,16 @@ function card(p) {
       ${p.selfhst_trending ? `<span>trend <b>${fmt(p.selfhst_trending)}</b></span>` : ''}
     </div>
     <div class="meta">${tags}${p.language ? `<span class="tag">${esc(p.language)}</span>` : ''}</div>
-    ${quickMarkBar(p)}
+    <div class="card-foot">${cardLinks(p)}${quickMarkBar(p)}</div>
   </article>`;
 }
 
 function table(rows) {
   const body = rows.map(p => {
     const cur = state.auth ? state.curation[p.id] : null;
-    const stCls = cur && cur.status ? ` is-mark-${cur.status}` : '';
+    const stCls = isStarred(cur) ? ' is-mark-watching' : '';
     return `<tr class="${stCls}" data-slug="${esc(p.slug)}">
-    <td><b>${esc(p.name)}</b><div class="meta">${badgeFor(p)}</div>${quickMarkBar(p)}</td>
+    <td><b>${esc(p.name)}</b><div class="meta">${badgeFor(p)}</div><div class="card-foot">${cardLinks(p)}${quickMarkBar(p)}</div></td>
     <td class="num">${fmt(p.stars)}</td>
     <td class="num">${p.stars_7d_delta ? '+' + fmt(p.stars_7d_delta) : '—'}</td>
     <td class="num">${p.selfhst_trending ? fmt(p.selfhst_trending) : '—'}</td>
@@ -261,15 +276,9 @@ async function loadFacets() {
     html += box('Language', 'lang', (s.topLanguages || []).slice(0, 12).map(x => [x.value, x.value, x.count]), [state.lang]);
     html += box('License', 'license', (s.topLicenses || []).slice(0, 10).map(x => [x.value, x.value, x.count]), [state.license]);
     if (state.auth) {
-      const mCounts = {};
-      Object.values(state.curation).forEach(c => { if (c.status) mCounts[c.status] = (mCounts[c.status] || 0) + 1; });
-      const activeTotal = Object.values(state.curation).filter(c => c.status && c.status !== 'dismissed').length;
-      html += box('My Marks', 'mark', [
-        ['marked', 'All marked', activeTotal],
-        ['watching', 'Watch', mCounts.watching || 0],
-        ['trying', 'Try', mCounts.trying || 0],
-        ['deployed', 'Use', mCounts.deployed || 0],
-        ['dismissed', 'Skipped', mCounts.dismissed || 0],
+      const starredTotal = Object.values(state.curation).filter(isStarred).length;
+      html += box('Saved', 'mark', [
+        ['starred', 'Starred', starredTotal],
       ], [state.markFilter]);
     }
     html += box('Tags', 'tag', (s.topTags || []).map(x => [x.value, x.value, x.count]), state.tags);
@@ -371,7 +380,7 @@ async function loadCurationMap() {
 async function toggleQuickMark(projectId, nextStatus, wrapEl) {
   if (!state.auth) return;
   const cur = state.curation[projectId] || null;
-  const clearing = cur && cur.status === nextStatus;
+  const clearing = isStarred(cur);
   wrapEl.classList.add('is-busy');
   try {
     if (clearing) {
@@ -398,20 +407,19 @@ async function toggleQuickMark(projectId, nextStatus, wrapEl) {
       if (!res.ok) throw new Error(res.status);
       state.curation[projectId] = await res.json();
     }
-    // Update the card/row UI in-place without scrolling/refetching the whole page
+    const now = state.curation[projectId];
+    const on = isStarred(now);
     const cardEl = wrapEl.closest('[data-slug]');
     if (cardEl) {
-      cardEl.classList.remove('is-mark-watching', 'is-mark-trying', 'is-mark-deployed', 'is-mark-dismissed', 'is-mark-inbox');
-      const now = state.curation[projectId];
-      if (now && now.status) cardEl.classList.add('is-mark-' + now.status);
-      wrapEl.querySelectorAll('.qmark-btn').forEach(b => {
-        const on = now && now.status === b.dataset.mark;
-        b.className = 'qmark-btn' + (on ? ` is-on is-${b.dataset.mark}` : '');
-      });
+      cardEl.classList.toggle('is-mark-watching', on);
     }
+    wrapEl.querySelectorAll('.qmark-btn').forEach(b => {
+      b.className = 'qmark-btn' + (on ? ' is-on is-starred' : '');
+      b.textContent = on ? '★ Starred' : '☆ Star';
+    });
     loadFacets();
   } catch (e) {
-    console.error('Quick mark failed', e);
+    console.error('Star toggle failed', e);
   } finally {
     wrapEl.classList.remove('is-busy');
   }
@@ -420,56 +428,14 @@ async function toggleQuickMark(projectId, nextStatus, wrapEl) {
 async function renderCuration(projectId) {
   const el = $('#curate');
   if (!state.auth) {
-    el.innerHTML = '<p class="muted">Sign in to keep a private list of what you are watching, trying or running.</p>';
+    el.innerHTML = '<p class="muted">Sign in to star apps and filter your saved list.</p>';
     return;
   }
-  let rec = state.curation[projectId] || null;
-  if (!rec) {
-    try {
-      const res = await fetch(`${API}/curation/records?perPage=1&filter=` + encodeURIComponent('project = ' + q_(projectId)), {
-        headers: { Authorization: state.auth.token },
-      });
-      if (res.ok) {
-        const r = await res.json();
-        rec = (r.items || [])[0] || null;
-        if (rec) state.curation[projectId] = rec;
-      }
-    } catch { /* falls through to an empty form */ }
-  }
-  const statuses = ['inbox', 'watching', 'trying', 'deployed', 'dismissed'];
-  el.innerHTML = `
-    <div class="curate-row">
-      <select id="cur-status">${statuses.map(s => `<option ${rec && rec.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
-      <input id="cur-priority" type="number" min="0" max="5" placeholder="priority" value="${rec && rec.priority != null ? esc(rec.priority) : ''}">
-    </div>
-    <p></p>
-    <textarea id="cur-memo" placeholder="Notes…">${esc(rec && rec.memo ? rec.memo : '')}</textarea>
-    <div class="row-end"><button id="cur-save" class="primary">Save</button></div>
-    <p id="cur-msg" class="muted"></p>`;
-  $('#cur-save').onclick = async () => {
-    const body = {
-      project: projectId,
-      status: $('#cur-status').value,
-      priority: Number($('#cur-priority').value || 0),
-      memo: $('#cur-memo').value,
-      owner: state.auth.email,
-    };
-    try {
-      const url = rec ? `${API}/curation/records/${rec.id}` : `${API}/curation/records`;
-      const res = await fetch(url, {
-        method: rec ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: state.auth.token },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error((await res.json()).message || res.status);
-      rec = await res.json();
-      state.curation[projectId] = rec;
-      $('#cur-msg').textContent = 'Saved.';
-      loadFacets();
-      if (state.view === 'explore') loadExplore();
-    } catch (e) {
-      $('#cur-msg').textContent = 'Save failed: ' + e.message;
-    }
+  const on = isStarred(state.curation[projectId]);
+  el.innerHTML = `<div class="qmarks" data-pid="${esc(projectId)}"><button type="button" class="qmark-btn ${on ? 'is-on is-starred' : ''}" data-mark="watching">${on ? '★ Starred' : '☆ Star'}</button></div>`;
+  el.querySelector('.qmark-btn').onclick = async () => {
+    await toggleQuickMark(projectId, 'watching', el.querySelector('.qmarks'));
+    if (state.view === 'explore') loadExplore();
   };
 }
 
@@ -604,6 +570,17 @@ function bind() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
   $('#list').addEventListener('click', e => {
+    const tbtn = e.target.closest('.tag-btn[data-tag]');
+    if (tbtn) {
+      e.stopPropagation();
+      const t = tbtn.dataset.tag;
+      if (state.tags.includes(t)) state.tags = state.tags.filter(x => x !== t);
+      else state.tags = [...state.tags, t];
+      state.page = 1;
+      loadFacets();
+      render();
+      return;
+    }
     const qbtn = e.target.closest('.qmark-btn');
     if (qbtn) {
       e.stopPropagation();

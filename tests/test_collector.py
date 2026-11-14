@@ -73,7 +73,7 @@ def test_merge_same_repo_from_both_sources():
   g = out[0]
   assert g['project']['canonical_key'] == 'github:n8n-io/n8n'
   assert g['project']['sources'] == ['awesome', 'selfhst']
-  assert g['project']['unified_tags'] == ['Automation', 'Workflow']
+  assert g['project']['unified_tags'] == ['in-use', 'Automation', 'Workflow']
   assert g['project']['stars'] == 120 and g['project']['forks'] == 7
   assert len(g['sources']) == 2
 

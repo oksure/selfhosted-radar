@@ -1,7 +1,15 @@
 """Merge upstream entries into unified project rows."""
+import json
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from .canonical import canonical_key, repo_host, slug
+
+_IN_USE_PATH = Path(__file__).with_name('in_use.json')
+try:
+  IN_USE_SLUGS = set(json.loads(_IN_USE_PATH.read_text(encoding='utf-8')))
+except (OSError, json.JSONDecodeError):
+  IN_USE_SLUGS = set()
 
 STAR_SURGE_ABS = 200
 STAR_SURGE_PCT = 0.20
@@ -64,9 +72,12 @@ def merge(entries):
     forks = max(int(r.forks or 0) for r in rows)
     trending = max(int(r.selfhst_trending or 0) for r in rows)
     archived = all(bool(r.archived) for r in rows) if len(rows) > 1 else bool(first.archived)
+    proj_slug = slug(key, taken)
+    if proj_slug in IN_USE_SLUGS and 'in-use' not in tags:
+      tags.insert(0, 'in-use')
     p = {
       'canonical_key': key,
-      'slug': slug(key, taken),
+      'slug': proj_slug,
       'name': name,
       'repo_full_name': _repo_full(repo_url),
       'repo_host': repo_host(repo_url),

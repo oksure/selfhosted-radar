@@ -6,7 +6,7 @@
 <title>Self-Hosted Radar</title>
 <meta name="description" content="A unified, continuously monitored directory of self-hosted applications from awesome-selfhosted and selfh.st.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/styles.css?v=8">
+<link rel="stylesheet" href="/styles.css?v=9">
 <link rel="alternate" type="application/rss+xml" title="Self-Hosted Radar" href="/radar.xml">
 </head>
 <body>
@@ -37,6 +37,8 @@
   <section class="results">
     <div class="presets" id="presets" role="group" aria-label="Quick presets">
       <button class="chip is-on" data-preset="">All</button>
+      <button class="chip" data-preset="in-use">In Use</button>
+      <button class="chip" data-preset="starred">Starred</button>
       <button class="chip" data-preset="both">In both directories</button>
       <button class="chip" data-preset="surge">7-day star surge</button>
       <button class="chip" data-preset="release">Recent release</button>
@@ -89,6 +91,6 @@
   </form>
 </dialog>
 
-<script type="module" src="/app.js?v=8"></script>
+<script type="module" src="/app.js?v=9"></script>
 </body>
 </html>
