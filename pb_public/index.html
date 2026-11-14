@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-Hosted Radar</title>
+<meta name="description" content="A unified, continuously monitored directory of self-hosted applications from awesome-selfhosted and selfh.st.">
+<link rel="stylesheet" href="/styles.css">
+<link rel="alternate" type="application/rss+xml" title="Self-Hosted Radar" href="/radar.xml">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">Self-Hosted Radar</a>
+  <nav class="tabs" role="tablist">
+    <button class="tab is-on" data-view="explore" role="tab">Explore</button>
+    <button class="tab" data-view="radar" role="tab">Changes</button>
+  </nav>
+  <div class="top-right">
+    <input id="q" class="search" type="search" placeholder="Search name, description, repo, tag…" autocomplete="off" aria-label="Search applications">
+    <button id="theme" class="icon-btn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <button id="login" class="ghost">Sign in</button>
+  </div>
+</header>
+
+<div class="statline" id="statline" aria-live="polite"></div>
+
+<main class="layout">
+  <aside id="facets" class="facets" aria-label="Filters">
+    <div class="facet-head">
+      <span>Filters</span>
+      <button id="clear" class="link">Reset</button>
+    </div>
+    <div id="facet-body"></div>
+  </aside>
+
+  <section class="results">
+    <div class="presets" id="presets" role="group" aria-label="Quick presets">
+      <button class="chip is-on" data-preset="">All</button>
+      <button class="chip" data-preset="both">In both directories</button>
+      <button class="chip" data-preset="surge">7-day star surge</button>
+      <button class="chip" data-preset="release">Recent release</button>
+      <button class="chip" data-preset="new">Newly listed</button>
+    </div>
+    <div class="toolbar">
+      <button id="facet-toggle" class="drawer-btn ghost" aria-expanded="false" aria-controls="facets">Filters</button>
+      <span id="count" class="count"></span>
+      <div class="toolbar-right">
+        <label class="sort-label">Sort
+          <select id="sort">
+            <option value="-selfhst_trending">selfh.st trending</option>
+            <option value="-stars_7d_delta">7-day stars</option>
+            <option value="-stars">Total stars</option>
+            <option value="-last_commit_at">Last commit</option>
+            <option value="-latest_release_at">Last release</option>
+            <option value="-first_seen_at">First seen</option>
+            <option value="name">Name</option>
+          </select>
+        </label>
+        <div class="seg" role="group" aria-label="Layout">
+          <button id="view-cards" class="seg-btn is-on" title="Card view">▦</button>
+          <button id="view-table" class="seg-btn" title="Table view">▤</button>
+        </div>
+      </div>
+    </div>
+    <div id="list" class="cards"></div>
+    <div class="pager" id="pager"></div>
+  </section>
+</main>
+
+<!-- detail -->
+<dialog id="detail" class="detail">
+  <button id="detail-close" class="detail-close" aria-label="Close">×</button>
+  <div id="detail-body"></div>
+</dialog>
+
+<!-- auth -->
+<dialog id="authdlg" class="auth">
+  <form id="authform" method="dialog">
+    <h2>Sign in</h2>
+    <p class="muted">Your curation list is private to your account.</p>
+    <label>Email<input name="email" type="email" required autocomplete="username"></label>
+    <label>Password<input name="password" type="password" required autocomplete="current-password"></label>
+    <p id="auth-err" class="err" role="alert"></p>
+    <div class="row-end">
+      <button type="button" id="auth-cancel" class="ghost">Cancel</button>
+      <button type="submit" class="primary">Sign in</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="module" src="/app.js?v=6"></script>
+</body>
+</html>
