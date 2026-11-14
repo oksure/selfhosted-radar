@@ -3,12 +3,34 @@
 // and a slug route that serves the app shell with per-app metadata.
 
 routerAdd('GET', '/api/radar/summary', (e) => {
-  const cache = $app.store().get('radar_summary')
+  const rawFlt = String((e.requestInfo().query && e.requestInfo().query['filter']) || '').trim()
   const now = Date.now()
-  if (cache && now - cache.at < 300000) {
-    return e.json(200, cache.body)
+
+  const starredForRows = (rowIdSet) => {
+    if (!e.auth) return null
+    try {
+      const cur = $app.findRecordsByFilter('curation', 'status != "dismissed"', '', 2000, 0)
+      if (!rowIdSet) return cur.length
+      let n = 0
+      for (const c of cur) {
+        if (rowIdSet[c.getString('project')]) n++
+      }
+      return n
+    } catch (_) {
+      return 0
+    }
   }
-  // $app.countRecords returns 0 on this build; count through the filter API.
+
+  if (!rawFlt) {
+    const cache = $app.store().get('radar_summary')
+    if (cache && now - cache.at < 300000) {
+      const out = Object.assign({}, cache.body)
+      const st = starredForRows(null)
+      if (st !== null) out.starred = st
+      return e.json(200, out)
+    }
+  }
+
   const countOf = (coll, flt) => {
     try {
       let n = 0
@@ -22,13 +44,7 @@ routerAdd('GET', '/api/radar/summary', (e) => {
       return 0
     }
   }
-  const total = countOf('projects', '1=1')
-  const bySource = {
-    awesome: countOf('source_entries', 'source = "awesome"'),
-    selfhst: countOf('source_entries', 'source = "selfhst"'),
-  }
 
-  // Facets: walk a bounded sample. 2k rows is cheap once per cache window.
   const tags = {}
   const langs = {}
   const lics = {}
@@ -36,26 +52,62 @@ routerAdd('GET', '/api/radar/summary', (e) => {
     if (!key) return
     cnt[key] = (cnt[key] || 0) + 1
   }
+
   let rows = []
   try {
-    rows = $app.findRecordsByFilter('projects', '1=1', '', 4000, 0)
+    rows = $app.findRecordsByFilter('projects', rawFlt || '1=1', '', 4000, 0)
   } catch (_) {
     rows = []
   }
+
   let lastSync = ''
+  let inUse = 0
+  let inBoth = 0
+  let srcAwesome = 0
+  let srcSelfhst = 0
+  const act = { active: 0, slow: 0, stale: 0, archived: 0 }
+  const stars = { lt500: 0, '500-5000': 0, gt5000: 0 }
+  const rowIds = e.auth ? {} : null
+
   for (const r of rows) {
+    if (rowIds) rowIds[r.id] = true
     let ts = []
     try {
       ts = JSON.parse(r.getString('unified_tags') || '[]')
     } catch (_) {
       ts = []
     }
-    for (const t of ts) bump(tags, String(t))
+    for (const t of ts) {
+      const s = String(t)
+      if (s === 'in-use') inUse++
+      else bump(tags, s)
+    }
+    let srcs = []
+    try {
+      srcs = JSON.parse(r.getString('sources') || '[]')
+    } catch (_) {
+      srcs = []
+    }
+    const hasA = srcs.includes('awesome')
+    const hasS = srcs.includes('selfhst')
+    if (hasA) srcAwesome++
+    if (hasS) srcSelfhst++
+    if (hasA && hasS) inBoth++
+
+    const st = r.getString('activity_status')
+    if (st in act) act[st]++
+
+    const sc = Number(r.getInt('stars') || 0)
+    if (sc < 500) stars.lt500++
+    else if (sc < 5000) stars['500-5000']++
+    else stars.gt5000++
+
     bump(langs, r.getString('language'))
     bump(lics, r.getString('license'))
     const d = r.getString('last_synced_at')
     if (d > lastSync) lastSync = d
   }
+
   const top = (cnt, n) =>
     Object.entries(cnt)
       .sort((a, b) => b[1] - a[1])
@@ -63,26 +115,36 @@ routerAdd('GET', '/api/radar/summary', (e) => {
       .map(([k, v]) => ({ value: k, count: v }))
 
   const body = {
-    total: total,
-    bySource: bySource,
-    entryCount: bySource.awesome + bySource.selfhst,
-    inBoth: countOf('projects', 'sources ~ "awesome" && sources ~ "selfhst"'),
-    inUse: countOf('projects', 'unified_tags ~ "in-use"'),
+    total: rows.length,
+    bySource: {
+      awesome: srcAwesome,
+      selfhst: srcSelfhst,
+      both: inBoth,
+      any: rows.length,
+    },
+    inBoth: inBoth,
+    inUse: inUse,
     lastSyncedAt: lastSync,
     topTags: top(tags, 40),
     topLanguages: top(langs, 25),
     topLicenses: top(lics, 20),
-    activity: {
-      active: countOf('projects', 'activity_status = "active"'),
-      slow: countOf('projects', 'activity_status = "slow"'),
-      stale: countOf('projects', 'activity_status = "stale"'),
-      archived: countOf('projects', 'activity_status = "archived"'),
-    },
-    events: countOf('surveillance_events', '1=1'),
+    activity: act,
+    stars: stars,
     generatedAt: new Date().toISOString(),
   }
-  $app.store().set('radar_summary', { at: now, body: body })
-  return e.json(200, body)
+
+  if (!rawFlt) {
+    const seA = countOf('source_entries', 'source = "awesome"')
+    const seS = countOf('source_entries', 'source = "selfhst"')
+    body.entryCount = seA + seS
+    body.events = countOf('surveillance_events', '1=1')
+    $app.store().set('radar_summary', { at: now, body: body })
+  }
+
+  const out = Object.assign({}, body)
+  const stCount = starredForRows(rawFlt ? rowIds : null)
+  if (stCount !== null) out.starred = stCount
+  return e.json(200, out)
 })
 
 routerAdd('GET', '/radar.xml', (e) => {

@@ -284,6 +284,7 @@ async function loadExplore() {
     }
     renderPager(d);
     writeUrl(true);
+    if (flt !== lastFacetFilter) loadFacets(flt);
   } catch (e) {
     if (token !== reqToken) return;
     list.className = '';
@@ -311,12 +312,26 @@ function renderPager(d) {
 }
 
 let lastSummary = null;
+let lastFacetFilter = null;
+let facetToken = 0;
+
+function ensureSelected(opts, selValues) {
+  const seen = new Set(opts.map(x => x.value));
+  const out = [...opts];
+  for (const v of selValues) {
+    if (v && !seen.has(v)) out.unshift({ value: v, count: 0 });
+  }
+  return out;
+}
+
 function renderFacets(s) {
   if (!s) return;
   const box = (title, name, opts, sel, extra = '') => `<div class="facet"><h3>${title}</h3>` + opts.map(([v, label, n]) =>
     `<label title="${esc(label)}"><input type="checkbox" data-facet="${name}" value="${esc(v)}" ${sel.includes(v) ? 'checked' : ''}><span class="facet-lbl">${esc(label)}</span>${n != null ? `<span class="n">${fmt(n)}</span>` : ''}</label>`).join('') + extra + '</div>';
 
-  const starredTotal = state.auth ? Object.values(state.curation).filter(isStarred).length : null;
+  const starredTotal = s.starred != null
+    ? s.starred
+    : (state.auth ? Object.values(state.curation).filter(isStarred).length : null);
   const inUseOn = state.inUse || state.preset === 'in-use';
   const starredOn = state.markFilter === 'starred' || state.preset === 'starred';
   let html = `<div class="facet"><h3>My List</h3>` +
@@ -324,17 +339,34 @@ function renderFacets(s) {
     `<label title="Starred"><input type="checkbox" data-facet="mark" value="starred" ${starredOn ? 'checked' : ''}><span class="facet-lbl">Starred</span><span class="n">${starredTotal != null ? fmt(starredTotal) : 'sign in'}</span></label>` +
     `</div>`;
 
-  const src = [['awesome', 'awesome-selfhosted'], ['selfhst', 'selfh.st'], ['both', 'In both']];
-  html += `<div class="facet"><h3>Source</h3>` + src.map(([v, l]) =>
-    `<label title="${esc(l)}"><input type="radio" name="source" data-facet="source" value="${v}" ${state.source === v ? 'checked' : ''}><span class="facet-lbl">${l}</span></label>`).join('') +
-    `<label title="Any"><input type="radio" name="source" data-facet="source" value="" ${!state.source ? 'checked' : ''}><span class="facet-lbl">Any</span></label></div>`;
+  const bs = s.bySource || {};
+  const src = [
+    ['awesome', 'awesome-selfhosted', bs.awesome],
+    ['selfhst', 'selfh.st', bs.selfhst],
+    ['both', 'In both', bs.both ?? s.inBoth],
+  ];
+  html += `<div class="facet"><h3>Source</h3>` + src.map(([v, l, n]) =>
+    `<label title="${esc(l)}"><input type="radio" name="source" data-facet="source" value="${v}" ${state.source === v ? 'checked' : ''}><span class="facet-lbl">${l}</span>${n != null ? `<span class="n">${fmt(n)}</span>` : ''}</label>`).join('') +
+    `<label title="Any"><input type="radio" name="source" data-facet="source" value="" ${!state.source ? 'checked' : ''}><span class="facet-lbl">Any</span><span class="n">${fmt(bs.any ?? s.total)}</span></label></div>`;
+
   const actOrder = ['active', 'slow', 'stale', 'archived'];
   html += box('Activity', 'activity',
-    actOrder.filter(k => k in (s.activity || {})).map(k => [k, k, s.activity[k]]), [state.activity]);
-  html += box('Stars', 'stars', [['lt500', '< 500'], ['500-5000', '500 – 5,000'], ['gt5000', '5,000+']], [state.stars]);
-  html += box('Language', 'lang', (s.topLanguages || []).slice(0, 12).map(x => [x.value, x.value, x.count]), [state.lang]);
-  html += box('License', 'license', (s.topLicenses || []).slice(0, 10).map(x => [x.value, x.value, x.count]), [state.license]);
-  const allTags = (s.topTags || []).filter(x => x.value !== 'in-use');
+    actOrder.map(k => [k, k, (s.activity || {})[k] ?? 0]), [state.activity]);
+
+  const st = s.stars || {};
+  html += box('Stars', 'stars', [
+    ['lt500', '< 500', st.lt500 ?? 0],
+    ['500-5000', '500 – 5,000', st['500-5000'] ?? 0],
+    ['gt5000', '5,000+', st.gt5000 ?? 0],
+  ], [state.stars]);
+
+  const langs = ensureSelected((s.topLanguages || []).slice(0, 12), state.lang ? [state.lang] : []);
+  html += box('Language', 'lang', langs.map(x => [x.value, x.value, x.count]), [state.lang]);
+
+  const lics = ensureSelected((s.topLicenses || []).slice(0, 10), state.license ? [state.license] : []);
+  html += box('License', 'license', lics.map(x => [x.value, x.value, x.count]), [state.license]);
+
+  const allTags = ensureSelected((s.topTags || []).filter(x => x.value !== 'in-use'), state.tags);
   const shownTags = state.showAllTags ? allTags : allTags.slice(0, 12);
   const moreBtn = allTags.length > 12
     ? `<button type="button" id="tags-more" class="link more">${state.showAllTags ? 'Show fewer' : `Show all (${allTags.length})`}</button>`
@@ -343,21 +375,28 @@ function renderFacets(s) {
   $('#facet-body').innerHTML = html;
 }
 
-async function loadFacets() {
+async function loadFacets(flt = '') {
+  const token = ++facetToken;
+  lastFacetFilter = flt;
   try {
-    const s = await fetch('/api/radar/summary').then(r => r.json());
+    const url = '/api/radar/summary' + (flt ? '?filter=' + encodeURIComponent(flt) : '');
+    const opts = state.auth ? { headers: { Authorization: state.auth.token } } : {};
+    const s = await fetch(url, opts).then(r => r.json());
+    if (token !== facetToken) return;
     lastSummary = s;
-    const stat = [
-      `<span><b>${fmt(s.total)}</b> apps</span>`,
-      `<span><b>${fmt(s.inBoth)}</b> in both directories</span>`,
-      `<span>awesome <b>${fmt(s.bySource.awesome)}</b></span>`,
-      `<span>selfh.st <b>${fmt(s.bySource.selfhst)}</b></span>`,
-      s.lastSyncedAt ? `<span>synced <b>${esc(s.lastSyncedAt)}</b></span>` : '',
-    ].filter(Boolean).join('');
-    $('#statline').innerHTML = stat;
+    if (!flt) {
+      const stat = [
+        `<span><b>${fmt(s.total)}</b> apps</span>`,
+        `<span><b>${fmt(s.inBoth)}</b> in both directories</span>`,
+        `<span>awesome <b>${fmt(s.bySource.awesome)}</b></span>`,
+        `<span>selfh.st <b>${fmt(s.bySource.selfhst)}</b></span>`,
+        s.lastSyncedAt ? `<span>synced <b>${esc(s.lastSyncedAt)}</b></span>` : '',
+      ].filter(Boolean).join('');
+      $('#statline').innerHTML = stat;
+    }
     renderFacets(s);
   } catch (e) {
-    $('#statline').textContent = 'Summary unavailable.';
+    if (!flt) $('#statline').textContent = 'Summary unavailable.';
   }
 }
 
@@ -494,7 +533,7 @@ async function toggleQuickMark(projectId, nextStatus, wrapEl) {
       b.className = 'qmark-btn' + (on ? ' is-on is-starred' : '');
       b.textContent = on ? '★ Starred' : '☆ Star';
     });
-    loadFacets();
+    loadFacets(filterString());
   } catch (e) {
     console.error('Star toggle failed', e);
   } finally {
@@ -689,7 +728,7 @@ function bind() {
       if (state.tags.includes(t)) state.tags = state.tags.filter(x => x !== t);
       else state.tags = [...state.tags, t];
       state.page = 1;
-      loadFacets();
+      loadFacets(filterString());
       render();
       return;
     }
@@ -725,7 +764,7 @@ function bind() {
     if (state.auth) {
       saveAuth(null);
       $('#detail').close();
-      loadFacets();
+      loadFacets(filterString());
       render();
       return;
     }
@@ -746,7 +785,7 @@ function bind() {
       saveAuth({ token: j.token, email: j.record ? j.record.email : fd.get('email') });
       await loadCurationMap();
       $('#authdlg').close();
-      loadFacets();
+      loadFacets(filterString());
       render();
       if (state.slug) openDetail(state.slug, false);
     } catch (err) {
