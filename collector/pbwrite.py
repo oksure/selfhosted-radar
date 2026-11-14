@@ -177,10 +177,12 @@ def run(db, merged, today=None, dry_run=False, workers=1):
       for src in ('gh_trending', 'gh_popular'):
         if src in p['sources'] and src not in old_srcs:
           rows_ev.append(_event(pid, f'new_in_{src}', src, f'{p["name"]} added to {src}', {'source': src}, today))
+      old_stars = int(old.get('stars') or 0)
+      star_moved = abs(p['stars'] - old_stars) >= max(25, int(old_stars * 0.01))
       changed = (
         list(old.get('sources') or []) != p['sources']
         or list(old.get('unified_tags') or []) != p['unified_tags']
-        or int(old.get('stars') or 0) != p['stars']
+        or star_moved
         or (old.get('activity_status') or '') != p['activity_status']
       )
       if changed:

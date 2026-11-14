@@ -55,7 +55,7 @@ routerAdd('GET', '/api/radar/summary', (e) => {
 
   let rows = []
   try {
-    rows = $app.findRecordsByFilter('projects', rawFlt || '1=1', '', 4000, 0)
+    rows = $app.findRecordsByFilter('projects', rawFlt || '1=1', '', 10000, 0)
   } catch (_) {
     rows = []
   }

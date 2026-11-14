@@ -371,13 +371,15 @@ class GitHubPopular:
 
   def _default_queries(self):
     recent = (date.today() - timedelta(days=90)).isoformat()
-    return [
+    qs = [
       ('topic:self-hosted stars:>=500', 1),
       ('topic:self-hosted stars:>=500', 2),
       ('topic:selfhosted stars:>=300', 1),
-      ('stars:>=25000', 1),
       (f'created:>={recent} stars:>=1000', 1),
     ]
+    for page in range(1, 6):
+      qs.append(('stars:>=20000', page))
+    return qs
 
   def collect(self):
     seen = {}
