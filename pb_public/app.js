@@ -22,6 +22,8 @@ const state = {
   layout: 'cards',
   slug: '',          // detail route
   auth: null,
+  curation: {},      // projectId -> curation record
+  markFilter: '',    // '' | marked | watching | trying | deployed | dismissed
 };
 
 // ---------- helpers ----------
@@ -107,7 +109,30 @@ function filterString() {
     const d = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
     parts.push('first_seen_at >= ' + q_(d));
   }
+  if (state.auth && state.markFilter) {
+    const ids = Object.values(state.curation)
+      .filter(c => state.markFilter === 'marked' ? c.status && c.status !== 'dismissed' : c.status === state.markFilter)
+      .map(c => c.project);
+    if (!ids.length) return 'id = ""';
+    parts.push('(' + ids.slice(0, 150).map(id => 'id = ' + q_(id)).join(' || ') + ')');
+  }
   return parts.join(' && ');
+}
+
+const MARKS = [
+  ['watching', 'Watch'],
+  ['trying', 'Try'],
+  ['deployed', 'Use'],
+  ['dismissed', 'Skip'],
+];
+
+function quickMarkBar(p) {
+  if (!state.auth) return '';
+  const cur = state.curation[p.id];
+  const st = cur ? cur.status : '';
+  return `<div class="qmarks" data-pid="${esc(p.id)}">${MARKS.map(([val, label]) =>
+    `<button type="button" class="qmark-btn ${st === val ? 'is-on is-' + val : ''}" data-mark="${val}" title="${val}">${label}</button>`
+  ).join('')}</div>`;
 }
 
 // ---------- renderers ----------
@@ -127,10 +152,12 @@ function card(p) {
   const icon = safeUrl(p.icon_url);
   const tags = arr(p.unified_tags).slice(0, 4).map(t => `<span class="tag">${esc(t)}</span>`).join('');
   const d7 = Number(p.stars_7d_delta || 0);
-  return `<article class="card" data-slug="${esc(p.slug)}" tabindex="0" role="button">
+  const cur = state.auth ? state.curation[p.id] : null;
+  const stCls = cur && cur.status ? ` is-mark-${cur.status}` : '';
+  return `<article class="card${stCls}" data-slug="${esc(p.slug)}" tabindex="0" role="button">
     <div class="card-top">
       ${icon ? `<img class="icon" src="${esc(icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="icon"></div>'}
-      <div style="min-width:0">
+      <div style="min-width:0;flex:1">
         <h3>${esc(p.name)}</h3>
         <div class="badges">${badgeFor(p)}</div>
       </div>
@@ -142,12 +169,16 @@ function card(p) {
       ${p.selfhst_trending ? `<span>trend <b>${fmt(p.selfhst_trending)}</b></span>` : ''}
     </div>
     <div class="meta">${tags}${p.language ? `<span class="tag">${esc(p.language)}</span>` : ''}</div>
+    ${quickMarkBar(p)}
   </article>`;
 }
 
 function table(rows) {
-  const body = rows.map(p => `<tr data-slug="${esc(p.slug)}">
-    <td><b>${esc(p.name)}</b><div class="meta">${badgeFor(p)}</div></td>
+  const body = rows.map(p => {
+    const cur = state.auth ? state.curation[p.id] : null;
+    const stCls = cur && cur.status ? ` is-mark-${cur.status}` : '';
+    return `<tr class="${stCls}" data-slug="${esc(p.slug)}">
+    <td><b>${esc(p.name)}</b><div class="meta">${badgeFor(p)}</div>${quickMarkBar(p)}</td>
     <td class="num">${fmt(p.stars)}</td>
     <td class="num">${p.stars_7d_delta ? '+' + fmt(p.stars_7d_delta) : '—'}</td>
     <td class="num">${p.selfhst_trending ? fmt(p.selfhst_trending) : '—'}</td>
@@ -155,7 +186,8 @@ function table(rows) {
     <td>${esc(p.license || '—')}</td>
     <td>${esc(p.last_commit_at || '—')}</td>
     <td>${esc(p.latest_release_at || '—')}</td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
   return `<table class="tbl"><thead><tr>
     <th>App</th><th>Stars</th><th>7d</th><th>Trend</th><th>Language</th><th>License</th><th>Commit</th><th>Release</th>
   </tr></thead><tbody>${body}</tbody></table>`;
@@ -228,6 +260,18 @@ async function loadFacets() {
     html += box('Stars', 'stars', [['lt500', '< 500'], ['500-5000', '500 – 5,000'], ['gt5000', '5,000+']], [state.stars]);
     html += box('Language', 'lang', (s.topLanguages || []).slice(0, 12).map(x => [x.value, x.value, x.count]), [state.lang]);
     html += box('License', 'license', (s.topLicenses || []).slice(0, 10).map(x => [x.value, x.value, x.count]), [state.license]);
+    if (state.auth) {
+      const mCounts = {};
+      Object.values(state.curation).forEach(c => { if (c.status) mCounts[c.status] = (mCounts[c.status] || 0) + 1; });
+      const activeTotal = Object.values(state.curation).filter(c => c.status && c.status !== 'dismissed').length;
+      html += box('My Marks', 'mark', [
+        ['marked', 'All marked', activeTotal],
+        ['watching', 'Watch', mCounts.watching || 0],
+        ['trying', 'Try', mCounts.trying || 0],
+        ['deployed', 'Use', mCounts.deployed || 0],
+        ['dismissed', 'Skipped', mCounts.dismissed || 0],
+      ], [state.markFilter]);
+    }
     html += box('Tags', 'tag', (s.topTags || []).map(x => [x.value, x.value, x.count]), state.tags);
     $('#facet-body').innerHTML = html;
 
@@ -306,17 +350,92 @@ function spark(items) {
   </svg><p class="muted">${esc(pts[0].d)} → ${esc(pts[pts.length - 1].d)} · ${fmt(lo)} → ${fmt(hi)} stars</div>`;
 }
 
+async function loadCurationMap() {
+  state.curation = {};
+  if (!state.auth) return;
+  try {
+    const r = await fetch(`${API}/curation/records?perPage=500`, {
+      headers: { Authorization: state.auth.token },
+    });
+    if (!r.ok) {
+      if (r.status === 401 || r.status === 403) saveAuth(null);
+      return;
+    }
+    const j = await r.json();
+    for (const item of (j.items || [])) {
+      state.curation[item.project] = item;
+    }
+  } catch { /* ignore */ }
+}
+
+async function toggleQuickMark(projectId, nextStatus, wrapEl) {
+  if (!state.auth) return;
+  const cur = state.curation[projectId] || null;
+  const clearing = cur && cur.status === nextStatus;
+  wrapEl.classList.add('is-busy');
+  try {
+    if (clearing) {
+      const res = await fetch(`${API}/curation/records/${cur.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: state.auth.token },
+      });
+      if (!res.ok) throw new Error(res.status);
+      delete state.curation[projectId];
+    } else if (cur) {
+      const res = await fetch(`${API}/curation/records/${cur.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: state.auth.token },
+        body: JSON.stringify({ status: nextStatus, owner: state.auth.email }),
+      });
+      if (!res.ok) throw new Error(res.status);
+      state.curation[projectId] = await res.json();
+    } else {
+      const res = await fetch(`${API}/curation/records`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: state.auth.token },
+        body: JSON.stringify({ project: projectId, status: nextStatus, priority: 0, memo: '', owner: state.auth.email }),
+      });
+      if (!res.ok) throw new Error(res.status);
+      state.curation[projectId] = await res.json();
+    }
+    // Update the card/row UI in-place without scrolling/refetching the whole page
+    const cardEl = wrapEl.closest('[data-slug]');
+    if (cardEl) {
+      cardEl.classList.remove('is-mark-watching', 'is-mark-trying', 'is-mark-deployed', 'is-mark-dismissed', 'is-mark-inbox');
+      const now = state.curation[projectId];
+      if (now && now.status) cardEl.classList.add('is-mark-' + now.status);
+      wrapEl.querySelectorAll('.qmark-btn').forEach(b => {
+        const on = now && now.status === b.dataset.mark;
+        b.className = 'qmark-btn' + (on ? ` is-on is-${b.dataset.mark}` : '');
+      });
+    }
+    loadFacets();
+  } catch (e) {
+    console.error('Quick mark failed', e);
+  } finally {
+    wrapEl.classList.remove('is-busy');
+  }
+}
+
 async function renderCuration(projectId) {
   const el = $('#curate');
   if (!state.auth) {
     el.innerHTML = '<p class="muted">Sign in to keep a private list of what you are watching, trying or running.</p>';
     return;
   }
-  let rec = null;
-  try {
-    const r = await POST('curation/records?perPage=1&filter=' + encodeURIComponent('project = ' + q_(projectId)));
-    rec = (r.items || [])[0] || null;
-  } catch { /* falls through to an empty form */ }
+  let rec = state.curation[projectId] || null;
+  if (!rec) {
+    try {
+      const res = await fetch(`${API}/curation/records?perPage=1&filter=` + encodeURIComponent('project = ' + q_(projectId)), {
+        headers: { Authorization: state.auth.token },
+      });
+      if (res.ok) {
+        const r = await res.json();
+        rec = (r.items || [])[0] || null;
+        if (rec) state.curation[projectId] = rec;
+      }
+    } catch { /* falls through to an empty form */ }
+  }
   const statuses = ['inbox', 'watching', 'trying', 'deployed', 'dismissed'];
   el.innerHTML = `
     <div class="curate-row">
@@ -343,7 +462,11 @@ async function renderCuration(projectId) {
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error((await res.json()).message || res.status);
+      rec = await res.json();
+      state.curation[projectId] = rec;
       $('#cur-msg').textContent = 'Saved.';
+      loadFacets();
+      if (state.view === 'explore') loadExplore();
     } catch (e) {
       $('#cur-msg').textContent = 'Save failed: ' + e.message;
     }
@@ -380,7 +503,11 @@ async function loadRadar() {
 function saveAuth(a) {
   state.auth = a;
   if (a) localStorage.setItem('radar_auth', JSON.stringify(a));
-  else localStorage.removeItem('radar_auth');
+  else {
+    localStorage.removeItem('radar_auth');
+    state.curation = {};
+    state.markFilter = '';
+  }
   $('#login').textContent = a ? (a.email.split('@')[0] + ' · sign out') : 'Sign in';
 }
 function restoreAuth() {
@@ -449,8 +576,9 @@ function bind() {
     if (f === 'source') { state.source = e.target.value; }
     else if (f === 'tag') {
       state.tags = [...document.querySelectorAll('[data-facet="tag"]:checked')].map(i => i.value);
-    } else if (f === 'activity' || f === 'stars') {
-      state[f] = e.target.checked ? e.target.value : '';
+    } else if (f === 'activity' || f === 'stars' || f === 'mark') {
+      const key = f === 'mark' ? 'markFilter' : f;
+      state[key] = e.target.checked ? e.target.value : '';
       document.querySelectorAll(`[data-facet="${f}"]`).forEach(i => { if (i !== e.target) i.checked = false; });
     } else {
       state[f] = e.target.checked ? e.target.value : '';
@@ -463,7 +591,7 @@ function bind() {
     $('#facet-toggle').setAttribute('aria-expanded', on ? 'true' : 'false');
   });
   $('#clear').addEventListener('click', () => {
-    Object.assign(state, { q: '', preset: '', source: '', tags: [], lang: '', license: '', activity: '', stars: '', page: 1 });
+    Object.assign(state, { q: '', preset: '', source: '', tags: [], lang: '', license: '', activity: '', stars: '', markFilter: '', page: 1 });
     $('#q').value = '';
     loadFacets();
     render();
@@ -476,6 +604,13 @@ function bind() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
   $('#list').addEventListener('click', e => {
+    const qbtn = e.target.closest('.qmark-btn');
+    if (qbtn) {
+      e.stopPropagation();
+      const wrap = qbtn.closest('.qmarks');
+      if (wrap) toggleQuickMark(wrap.dataset.pid, qbtn.dataset.mark, wrap);
+      return;
+    }
     const row = e.target.closest('[data-slug]');
     if (!row) return;
     if (e.target.closest('a')) return;
@@ -498,7 +633,13 @@ function bind() {
     localStorage.setItem('radar_theme', cur);
   });
   $('#login').addEventListener('click', () => {
-    if (state.auth) { saveAuth(null); $('#detail').close(); return; }
+    if (state.auth) {
+      saveAuth(null);
+      $('#detail').close();
+      loadFacets();
+      render();
+      return;
+    }
     $('#authdlg').showModal();
   });
   $('#auth-cancel').addEventListener('click', () => $('#authdlg').close());
@@ -514,7 +655,10 @@ function bind() {
       const j = await r.json();
       if (!r.ok) throw new Error(j.message || 'Sign in failed');
       saveAuth({ token: j.token, email: j.record ? j.record.email : fd.get('email') });
+      await loadCurationMap();
       $('#authdlg').close();
+      loadFacets();
+      render();
       if (state.slug) openDetail(state.slug, false);
     } catch (err) {
       $('#auth-err').textContent = err.message;
@@ -528,7 +672,7 @@ function bind() {
   });
 }
 
-function boot() {
+async function boot() {
   const theme = localStorage.getItem('radar_theme');
   document.documentElement.dataset.theme = theme || 'dark';
   restoreAuth();
@@ -536,6 +680,7 @@ function boot() {
   $('#q').value = state.q;
   $('#sort').value = state.sort;
   if (state.layout === 'table') { $('#view-table').classList.add('is-on'); $('#view-cards').classList.remove('is-on'); }
+  await loadCurationMap();
   loadFacets();
   bind();
   render();

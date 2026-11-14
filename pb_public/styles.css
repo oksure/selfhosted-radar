@@ -131,6 +131,22 @@ select {
   box-shadow: var(--shadow); transition: border-color .12s ease, transform .12s ease;
 }
 .card:hover { border-color: var(--accent-2); transform: translateY(-1px); }
+.card.is-mark-watching { border-color: #38bdf8; }
+.card.is-mark-trying { border-color: #f59e0b; }
+.card.is-mark-deployed { border-color: #22c55e; }
+.card.is-mark-dismissed, tr.is-mark-dismissed { opacity: .45; }
+.qmarks { display: flex; gap: 5px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; border-top: 1px dashed var(--line); }
+table.tbl .qmarks { border-top: 0; padding-top: 4px; margin-top: 2px; }
+.qmarks.is-busy { opacity: .6; pointer-events: none; }
+.qmark-btn {
+  background: var(--bg-2); color: var(--muted); border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 8px; font-size: 11.5px; cursor: pointer;
+}
+.qmark-btn:hover { color: var(--text); border-color: var(--accent-2); }
+.qmark-btn.is-on.is-watching { background: rgba(56, 189, 248, .18); color: #38bdf8; border-color: #38bdf8; }
+.qmark-btn.is-on.is-trying { background: rgba(245, 158, 11, .18); color: #f59e0b; border-color: #f59e0b; }
+.qmark-btn.is-on.is-deployed { background: rgba(34, 197, 94, .18); color: #22c55e; border-color: #22c55e; }
+.qmark-btn.is-on.is-dismissed { background: rgba(148, 163, 184, .15); color: var(--muted); border-color: var(--muted); }
 .card-top { display: flex; gap: 10px; align-items: flex-start; }
 .icon {
   width: 34px; height: 34px; flex: 0 0 34px; border-radius: 8px;
