@@ -391,8 +391,6 @@ async function loadFacets(flt = '') {
     const url = '/api/radar/summary' + (flt ? '?filter=' + encodeURIComponent(flt) : '');
     const opts = state.auth ? { headers: { Authorization: state.auth.token } } : {};
     const s = await fetch(url, opts).then(r => r.json());
-    if (token !== facetToken) return;
-    lastSummary = s;
     if (!flt) {
       const stat = [
         `<span><b>${fmt(s.total)}</b> apps</span>`,
@@ -405,6 +403,8 @@ async function loadFacets(flt = '') {
       ].filter(Boolean).join('');
       $('#statline').innerHTML = stat;
     }
+    if (token !== facetToken) return;
+    lastSummary = s;
     renderFacets(s);
   } catch (e) {
     if (!flt) $('#statline').textContent = 'Summary unavailable.';
