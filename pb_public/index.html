@@ -48,6 +48,14 @@
       <button id="facet-toggle" class="drawer-btn ghost" aria-expanded="false" aria-controls="facets">Filters</button>
       <span id="count" class="count"></span>
       <div class="toolbar-right">
+        <label class="sort-label">Show
+          <select id="per-page" aria-label="Results per page">
+            <option value="30">30</option>
+            <option value="60">60</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </label>
         <label class="sort-label">Sort
           <select id="sort">
             <option value="-selfhst_trending">selfh.st trending</option>
@@ -91,6 +99,6 @@
   </form>
 </dialog>
 
-<script type="module" src="/app.js?v=11"></script>
+<script type="module" src="/app.js?v=12"></script>
 </body>
 </html>

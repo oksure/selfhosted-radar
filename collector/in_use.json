@@ -26,5 +26,12 @@
   "zulip-zulip",
   "searxng-searxng",
   "langfuse-langfuse",
-  "rss-bridge-rss-bridge"
+  "rss-bridge-rss-bridge",
+  "dagucloud-dagu",
+  "fail2ban-fail2ban",
+  "jgraph-drawio",
+  "nginx-nginx",
+  "openprinting-cups",
+  "postfix-org-postfix-org-postfix",
+  "samba-org-samba-org-samba"
 ]

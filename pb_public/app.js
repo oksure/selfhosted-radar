@@ -2,7 +2,8 @@
 // or escaped markup so upstream descriptions can never inject HTML.
 
 const API = '/api/collections';
-const PER = 30;
+const DEFAULT_PER = 30;
+const PER_OPTIONS = [30, 60, 100, 200];
 const $ = (s, r = document) => r.querySelector(s);
 const POST = q => fetch(API + '/' + q).then(r => r.ok ? r.json() : Promise.reject(new Error(q + ' -> ' + r.status)));
 
@@ -20,6 +21,7 @@ const state = {
   hideArchived: true,
   stars: '',         // '' | 0-500 | 500-5000 | 5000+
   sort: '-selfhst_trending',
+  perPage: DEFAULT_PER,
   page: 1,
   layout: 'cards',
   slug: '',          // detail route
@@ -54,6 +56,8 @@ function readUrl() {
   state.stars = u.get('stars') || '';
   state.hideArchived = u.get('arch') !== '1' ? true : false;
   state.sort = u.get('sort') || '-selfhst_trending';
+  const rawPer = parseInt(u.get('per') || '', 10);
+  state.perPage = PER_OPTIONS.includes(rawPer) ? rawPer : DEFAULT_PER;
   state.page = Math.max(1, parseInt(u.get('page') || '1', 10) || 1);
   if (state.preset === 'both' && !state.source) state.source = 'both';
   state.layout = u.get('layout') === 'table' ? 'table' : 'cards';
@@ -75,6 +79,7 @@ function writeUrl(replace = false) {
   if (state.stars) u.set('stars', state.stars);
   if (!state.hideArchived) u.set('arch', '1');
   if (state.sort !== '-selfhst_trending') u.set('sort', state.sort);
+  if (state.perPage !== DEFAULT_PER) u.set('per', String(state.perPage));
   if (state.page > 1) u.set('page', String(state.page));
   if (state.layout === 'table') u.set('layout', 'table');
   const base = state.view === 'radar' ? '/radar' : '/';
@@ -266,7 +271,7 @@ async function loadExplore() {
   list.className = state.layout === 'table' ? '' : 'cards';
   list.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
   const flt = filterString();
-  const params = { sort: state.sort, page: state.page, perPage: PER };
+  const params = { sort: state.sort, page: state.page, perPage: state.perPage };
   if (flt) params.filter = flt;
   const qs = new URLSearchParams(params).toString();
   try {
@@ -601,6 +606,8 @@ function restoreAuth() {
 
 // ---------- wiring ----------
 function render() {
+  if ($('#per-page')) $('#per-page').value = String(state.perPage);
+  if ($('#sort')) $('#sort').value = state.sort;
   if (state.view === 'explore') {
     const activeChip = state.preset || (state.inUse ? 'in-use' : state.markFilter === 'starred' ? 'starred' : state.source === 'both' ? 'both' : '');
     document.querySelectorAll('#presets [data-preset]').forEach(c =>
@@ -646,6 +653,7 @@ function bind() {
     render();
   });
   $('#sort').addEventListener('change', e => { state.sort = e.target.value; state.page = 1; render(); });
+  $('#per-page').addEventListener('change', e => { state.perPage = Number(e.target.value) || DEFAULT_PER; state.page = 1; render(); });
   $('#view-cards').addEventListener('click', () => {
     state.layout = 'cards';
     $('#view-cards').classList.add('is-on'); $('#view-table').classList.remove('is-on');
