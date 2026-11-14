@@ -31,14 +31,20 @@ class PB:
     h['Content-Type'] = 'application/json'
     if auth and self.token:
       h['Authorization'] = self.token
-    req = urllib.request.Request(url, data=data, headers=h, method=method)
-    try:
-      with urllib.request.urlopen(req, timeout=120) as r:
-        raw = r.read()
-        return json.loads(raw) if raw.strip() else None
-    except urllib.error.HTTPError as e:
-      detail = e.read().decode(errors='replace')[:400]
-      raise RuntimeError(f'{method} {path} -> {e.code}: {detail}') from None
+    for attempt in range(5):
+      req = urllib.request.Request(url, data=data, headers=h, method=method)
+      try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+          raw = r.read()
+          return json.loads(raw) if raw.strip() else None
+      except urllib.error.HTTPError as e:
+        if e.code in (429, 502, 503, 504) and attempt < 4:
+          ra = e.headers.get('Retry-After') if e.headers else None
+          wait = int(ra) if (ra and ra.isdigit()) else min(30, 2 * (2 ** attempt))
+          time.sleep(wait)
+          continue
+        detail = e.read().decode(errors='replace')[:400]
+        raise RuntimeError(f'{method} {path} -> {e.code}: {detail}') from None
 
   def _login(self, email, password):
     for attempt in range(4):
@@ -88,7 +94,7 @@ class PB:
         return 0
 
     out = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
       for n in pool.map(_one, rows):
         out += n
     return out

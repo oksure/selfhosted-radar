@@ -344,29 +344,67 @@ def _parse_trending_html(page_html, since='daily'):
 
 
 class GitHubTrending:
-  """``github.com/trending`` (daily + weekly), enriched via GitHub REST when a token exists."""
+  """``github.com/trending`` (daily/weekly/monthly + languages) plus 7d/30d breakout search."""
 
   name = 'gh_trending'
   BASE = 'https://github.com/trending'
+  DEFAULT_LANGUAGES = ('python', 'typescript', 'javascript', 'go', 'rust', 'c++', 'shell')
 
-  def __init__(self, sinces=('daily', 'weekly'), enrich=True):
+  def __init__(self, sinces=('daily', 'weekly', 'monthly'), languages=DEFAULT_LANGUAGES,
+               enrich=True, include_breakout=True):
     self.sinces = sinces
+    self.languages = languages
     self.enrich = enrich
+    self.include_breakout = include_breakout
 
-  def collect(self):
+  def _fetch_trending_pages(self):
+    pages = [(f'{self.BASE}?since={urllib.parse.quote(since)}', since, '') for since in self.sinces]
+    pages.extend(
+      (f'{self.BASE}/{urllib.parse.quote(lang, safe="")}?since=weekly', 'weekly', lang)
+      for lang in self.languages
+    )
     seen = {}
-    for since in self.sinces:
-      url = f'{self.BASE}?since={urllib.parse.quote(since)}'
-      raw_html = fetch(url, timeout=30).decode('utf-8', errors='replace')
+    for url, since, lang in pages:
+      try:
+        raw_html = fetch(url, timeout=30).decode('utf-8', errors='replace')
+      except Exception as exc:
+        print(f'  gh_trending skip {url}: {exc}', file=sys.stderr, flush=True)
+        continue
       for row in _parse_trending_html(raw_html, since=since):
         fn = row['full_name']
         if fn not in seen:
+          row['trending_lang'] = lang
           seen[fn] = row
         else:
-          seen[fn].setdefault('also_since', []).append(since)
+          seen[fn].setdefault('also_since', []).append(f'{lang or "all"}:{since}')
+    return seen
 
-    meta = {}
-    if self.enrich and _gh_token() and seen:
+  def _breakout_queries(self):
+    d7 = (date.today() - timedelta(days=7)).isoformat()
+    d30 = (date.today() - timedelta(days=30)).isoformat()
+    return [
+      (f'created:>={d7} stars:>=50', '7d'),
+      (f'created:>={d30} stars:>=200', '30d'),
+    ]
+
+  def collect(self):
+    seen = self._fetch_trending_pages()
+    breakout = {}
+    if self.include_breakout and _gh_token():
+      for q, window in self._breakout_queries():
+        try:
+          data = _gh_search_rest(q, page=1, per_page=100)
+        except Exception as exc:
+          print(f'  gh_trending breakout skip {q}: {exc}', file=sys.stderr, flush=True)
+          continue
+        for item in data.get('items') or []:
+          fn = item.get('full_name')
+          if fn and fn not in breakout:
+            breakout[fn] = (item, q, window)
+
+    meta = {fn: item for fn, (item, _, _) in breakout.items() if fn in seen}
+    to_enrich = [fn for fn in seen if fn not in meta]
+    if self.enrich and _gh_token() and to_enrich:
       def _fetch_one(fn):
         try:
           return fn, _gh_json(f'https://api.github.com/repos/{fn}', timeout=15)
@@ -374,15 +412,21 @@ class GitHubTrending:
           return fn, None
 
       with ThreadPoolExecutor(max_workers=4) as pool:
-        for fn, obj in pool.map(_fetch_one, seen.keys()):
+        for fn, obj in pool.map(_fetch_one, to_enrich):
           if obj:
             meta[fn] = obj
 
     for fn, row in seen.items():
       extra = {'since': row['since'], 'stars_period': row['stars_period']}
+      if row.get('trending_lang'):
+        extra['trending_lang'] = row['trending_lang']
+      src_url = (
+        f'{self.BASE}/{urllib.parse.quote(row["trending_lang"], safe="")}?since={row["since"]}'
+        if row.get('trending_lang') else f'{self.BASE}?since={row["since"]}'
+      )
       if fn in meta:
         yield _gh_raw_from_repo(
-          meta[fn], self.name, fn, f'https://github.com/trending?since={row["since"]}',
+          meta[fn], self.name, fn, src_url,
           extra_tags=['github-trending'], extra_payload=extra,
         )
       else:
@@ -398,9 +442,18 @@ class GitHubTrending:
           raw_tags=['github-trending'],
           stars=row['stars'],
           forks=row['forks'],
-          source_url=f'https://github.com/trending?since={row["since"]}',
+          source_url=src_url,
           raw_payload=row,
         )
+
+    for fn, (item, q, window) in breakout.items():
+      if fn in seen:
+        continue
+      yield _gh_raw_from_repo(
+        item, self.name, fn,
+        f'https://github.com/search?q={urllib.parse.quote(q)}&type=repositories',
+        extra_tags=['github-trending'], extra_payload={'breakout': window, 'query': q},
+      )
 
 
 class GitHubPopular:

@@ -224,6 +224,34 @@ def test_github_trending_parse_and_merge(monkeypatch):
   assert p['icon_url'] == 'https://github.com/acme.png?size=64'
 
 
+def test_github_trending_languages_and_breakout(monkeypatch):
+  from collector import sources as S
+  fetched = []
+  def fake_fetch(url, timeout=30):
+    fetched.append(url)
+    if '/c%2B%2B' in url:
+      return b'<article class="Box-row"><h2><a href="/fast/cpp-app">fast / cpp-app</a></h2><span>10 stars today</span></article>'
+    return b'<article class="Box-row"><h2><a href="/acme/cool-app">acme / cool-app</a></h2><span>99 stars today</span></article>'
+  def fake_search(q, page=1, per_page=100):
+    return {'items': [
+      {'full_name': 'acme/cool-app', 'name': 'cool-app', 'html_url': 'https://github.com/acme/cool-app',
+       'stargazers_count': 900, 'forks_count': 40, 'pushed_at': '2026-11-14T00:00:00Z', 'topics': []},
+      {'full_name': 'new/rising-app', 'name': 'rising-app', 'html_url': 'https://github.com/new/rising-app',
+       'stargazers_count': 350, 'forks_count': 15, 'pushed_at': '2026-11-14T00:00:00Z', 'topics': []},
+    ]}
+  monkeypatch.setattr(S, 'fetch', fake_fetch)
+  monkeypatch.setattr(S, '_gh_token', lambda: 'tok')
+  monkeypatch.setattr(S, '_gh_search_rest', fake_search)
+  monkeypatch.setattr(S, '_gh_json', lambda url, timeout=15: {'full_name': 'fast/cpp-app', 'name': 'cpp-app',
+    'html_url': 'https://github.com/fast/cpp-app', 'stargazers_count': 500, 'forks_count': 20, 'topics': []})
+  rows = list(S.GitHubTrending(sinces=('daily', 'monthly'), languages=('python', 'c++')).collect())
+  ids = [r.external_id for r in rows]
+  assert set(ids) == {'acme/cool-app', 'fast/cpp-app', 'new/rising-app'}
+  assert len(ids) == 3
+  assert any('/trending/c%2B%2B?since=weekly' in u for u in fetched)
+  assert any('/trending?since=monthly' in u for u in fetched)
+
+
 def test_github_popular_and_merge_with_awesome(monkeypatch):
   from collector import sources as S
   from collector.merge import merge
