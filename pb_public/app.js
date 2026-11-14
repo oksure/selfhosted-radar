@@ -59,7 +59,7 @@ function readUrl() {
   const rawPer = parseInt(u.get('per') || '', 10);
   state.perPage = PER_OPTIONS.includes(rawPer) ? rawPer : DEFAULT_PER;
   state.page = Math.max(1, parseInt(u.get('page') || '1', 10) || 1);
-  if (state.preset === 'both' && !state.source) state.source = 'both';
+  if ((state.preset === 'both' || state.preset === 'gh_trending' || state.preset === 'gh_popular') && !state.source) state.source = state.preset;
   state.layout = u.get('layout') === 'table' ? 'table' : 'cards';
   state.view = location.pathname === '/radar' ? 'radar' : 'explore';
   const m = location.pathname.match(/^\/apps\/([^/]+)$/);
@@ -162,6 +162,8 @@ function badgeFor(p) {
   if (srcs.includes('awesome') && srcs.includes('selfhst')) out.push('<span class="badge both">both</span>');
   else if (srcs.includes('awesome')) out.push('<span class="badge a">awesome</span>');
   else if (srcs.includes('selfhst')) out.push('<span class="badge s">selfh.st</span>');
+  if (srcs.includes('gh_trending')) out.push('<span class="badge gt">GH trending</span>');
+  if (srcs.includes('gh_popular')) out.push('<span class="badge gp">GH popular</span>');
   if (p.activity_status === 'archived') out.push('<span class="badge arch">archived</span>');
   else if (p.activity_status === 'stale') out.push('<span class="badge arch">stale</span>');
   else if (p.activity_status === 'slow') out.push('<span class="badge slow">slow</span>');
@@ -348,7 +350,9 @@ function renderFacets(s) {
   const src = [
     ['awesome', 'awesome-selfhosted', bs.awesome],
     ['selfhst', 'selfh.st', bs.selfhst],
-    ['both', 'In both', bs.both ?? s.inBoth],
+    ['gh_trending', 'GitHub Trending', bs.gh_trending ?? 0],
+    ['gh_popular', 'GitHub Popular', bs.gh_popular ?? 0],
+    ['both', 'In both dirs', bs.both ?? s.inBoth],
   ];
   html += `<div class="facet"><h3>Source</h3>` + src.map(([v, l, n]) =>
     `<label title="${esc(l)}"><input type="radio" name="source" data-facet="source" value="${v}" ${state.source === v ? 'checked' : ''}><span class="facet-lbl">${l}</span>${n != null ? `<span class="n">${fmt(n)}</span>` : ''}</label>`).join('') +
@@ -395,6 +399,8 @@ async function loadFacets(flt = '') {
         `<span><b>${fmt(s.inBoth)}</b> in both directories</span>`,
         `<span>awesome <b>${fmt(s.bySource.awesome)}</b></span>`,
         `<span>selfh.st <b>${fmt(s.bySource.selfhst)}</b></span>`,
+        s.bySource.gh_trending ? `<span>GH trending <b>${fmt(s.bySource.gh_trending)}</b></span>` : '',
+        s.bySource.gh_popular ? `<span>GH popular <b>${fmt(s.bySource.gh_popular)}</b></span>` : '',
         s.lastSyncedAt ? `<span>synced <b>${esc(s.lastSyncedAt)}</b></span>` : '',
       ].filter(Boolean).join('');
       $('#statline').innerHTML = stat;
@@ -609,12 +615,12 @@ function render() {
   if ($('#per-page')) $('#per-page').value = String(state.perPage);
   if ($('#sort')) $('#sort').value = state.sort;
   if (state.view === 'explore') {
-    const activeChip = state.preset || (state.inUse ? 'in-use' : state.markFilter === 'starred' ? 'starred' : state.source === 'both' ? 'both' : '');
+    const activeChip = state.preset || (state.inUse ? 'in-use' : state.markFilter === 'starred' ? 'starred' : (state.source === 'both' || state.source === 'gh_trending' || state.source === 'gh_popular') ? state.source : '');
     document.querySelectorAll('#presets [data-preset]').forEach(c =>
       c.classList.toggle('is-on', c.dataset.preset === activeChip));
   }
   if (state.view === 'radar') {
-    $('#presets').innerHTML = ['', 'new_in_awesome', 'new_in_selfhst', 'new_release', 'star_surge', 'archived_or_stale']
+    $('#presets').innerHTML = ['', 'new_in_awesome', 'new_in_selfhst', 'new_in_gh_trending', 'new_in_gh_popular', 'new_release', 'star_surge', 'archived_or_stale']
       .map(v => `<button class="chip ${state.preset === v ? 'is-on' : ''}" data-rpreset="${v}">${v ? v.replace(/_/g, ' ') : 'All'}</button>`).join('');
     loadRadar();
   } else {
@@ -643,8 +649,8 @@ function bind() {
     if (!b) return;
     if (state.view === 'radar') { state.preset = b.dataset.rpreset; render(); return; }
     state.preset = b.dataset.preset;
-    // "in both directories" is a source facet, everything else is its own filter
-    state.source = state.preset === 'both' ? 'both' : '';
+    // source presets map directly to the source facet
+    state.source = (state.preset === 'both' || state.preset === 'gh_trending' || state.preset === 'gh_popular') ? state.preset : '';
     state.inUse = state.preset === 'in-use';
     state.markFilter = state.preset === 'starred' ? 'starred' : '';
     document.querySelectorAll('#presets .chip').forEach(c => c.classList.toggle('is-on', c === b));
@@ -675,7 +681,7 @@ function bind() {
     if (!f) return;
     if (f === 'source') {
       state.source = e.target.value;
-      if (state.preset === 'both' && state.source !== 'both') state.preset = '';
+      if ((state.preset === 'both' || state.preset === 'gh_trending' || state.preset === 'gh_popular') && state.source !== state.preset) state.preset = '';
     } else if (f === 'inuse') {
       state.inUse = e.target.checked;
       if (!state.inUse && state.preset === 'in-use') state.preset = '';

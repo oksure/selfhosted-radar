@@ -195,3 +195,65 @@ def test_icon_slug_normalization():
   assert _selfhst_icon({'icon_override': 'https://example.com/a.png'}) == 'https://example.com/a.png'
   assert _normalize_icon_url('rahoot') == 'https://cdn.jsdelivr.net/gh/selfhst/icons/png/rahoot.png'
   assert _normalize_icon_url('') == ''
+
+
+def test_github_trending_parse_and_merge(monkeypatch):
+  from collector import sources as S
+  from collector.merge import merge
+  html_doc = '''
+  <article class="Box-row">
+    <h2><a href="/acme/cool-app">acme / cool-app</a></h2>
+    <p>Fast self-hosted tool &amp; dashboard</p>
+    <span itemprop="programmingLanguage">Go</span>
+    <a href="/acme/cool-app/stargazers">12,345</a>
+    <a href="/acme/cool-app/forks">678</a>
+    <span>420 stars today</span>
+  </article>'''
+  monkeypatch.setattr(S, 'fetch', lambda url, timeout=30: html_doc.encode())
+  monkeypatch.setattr(S, '_gh_token', lambda: '')
+  rows = list(S.GitHubTrending(sinces=('daily',), enrich=False).collect())
+  assert len(rows) == 1
+  r = rows[0]
+  assert (r.source, r.external_id, r.stars, r.forks) == ('gh_trending', 'acme/cool-app', 12345, 678)
+  assert 'Fast self-hosted tool & dashboard' in r.description
+  assert r.language == 'Go'
+  merged = merge(rows)
+  assert len(merged) == 1
+  p = merged[0]['project']
+  assert p['sources'] == ['gh_trending']
+  assert p['icon_url'] == 'https://github.com/acme.png?size=64'
+
+
+def test_github_popular_and_merge_with_awesome(monkeypatch):
+  from collector import sources as S
+  from collector.merge import merge
+  search_resp = {
+    'items': [{
+      'full_name': 'n8n-io/n8n',
+      'name': 'n8n',
+      'html_url': 'https://github.com/n8n-io/n8n',
+      'homepage': 'n8n.io',
+      'description': 'Workflow automation',
+      'language': 'TypeScript',
+      'stargazers_count': 99000,
+      'forks_count': 25000,
+      'pushed_at': '2026-11-14T00:00:00Z',
+      'archived': False,
+      'topics': ['self-hosted', 'automation'],
+      'license': {'spdx_id': 'NOASSERTION'},
+      'owner': {'login': 'n8n-io', 'avatar_url': 'https://avatars.githubusercontent.com/u/1?v=4'},
+    }]
+  }
+  monkeypatch.setattr(S, '_gh_json', lambda url, timeout=30: search_resp)
+  gh_rows = list(S.GitHubPopular(queries=[('topic:self-hosted', 1)]).collect())
+  assert len(gh_rows) == 1
+  assert gh_rows[0].website_url == 'https://n8n.io'
+  assert gh_rows[0].license == ''
+  aw = RawApp(source='awesome', external_id='n8n', name='n8n', repo_url='https://github.com/n8n-io/n8n',
+              website_url='https://n8n.io/', stars=50000, raw_tags=['Automation'])
+  merged = merge([aw, gh_rows[0]])
+  assert len(merged) == 1
+  p = merged[0]['project']
+  assert p['sources'] == ['awesome', 'gh_popular']
+  assert p['stars'] == 99000
+  assert 'github-popular' in p['unified_tags']

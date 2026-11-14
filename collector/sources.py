@@ -4,11 +4,17 @@ Each adapter yields one ``RawApp`` per upstream entry. ``sources`` lists the
 adapter names it contributes; Stage 2 adds ``gh_trending`` / ``gh_popular``
 here without touching the merge or the schema.
 """
+import html
 import io
 import json
+import os
+import re
 import tarfile
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 import yaml
 
@@ -189,10 +195,215 @@ class SelfhSt:
       )
 
 
-ADAPTERS = {AwesomeSelfhosted.name: AwesomeSelfhosted, SelfhSt.name: SelfhSt}
+def _gh_token():
+  return os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_PERSONAL_ACCESS_TOKEN') or ''
 
-# Stage 2 placeholders — declared so the schema and merge stay source-agnostic.
-PLANNED_SOURCES = ('gh_trending', 'gh_popular')
+
+def _gh_json(url, timeout=30):
+  headers = {
+    'User-Agent': UA['User-Agent'],
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  }
+  tok = _gh_token()
+  if tok:
+    headers['Authorization'] = f'Bearer {tok}'
+  req = urllib.request.Request(url, headers=headers)
+  with urllib.request.urlopen(req, timeout=timeout) as r:
+    return json.loads(r.read())
+
+
+def _clean_url(raw):
+  v = (raw or '').strip()
+  if not v:
+    return ''
+  if v.startswith(('http://', 'https://')):
+    return v[:500]
+  if '.' in v and ' ' not in v and ':' not in v:
+    return f'https://{v}'[:500]
+  return ''
+
+
+def _gh_raw_from_repo(repo_obj, source, ext_id, source_url, extra_tags=None, extra_payload=None):
+  full = repo_obj.get('full_name') or ext_id
+  owner = (repo_obj.get('owner') or {}).get('login') or (full.split('/')[0] if '/' in full else '')
+  avatar = (repo_obj.get('owner') or {}).get('avatar_url') or (f'https://github.com/{owner}.png?size=64' if owner else '')
+  lic = ((repo_obj.get('license') or {}).get('spdx_id') or '')
+  if lic == 'NOASSERTION':
+    lic = ''
+  tags = [t for t in (repo_obj.get('topics') or [])[:6] if t]
+  for t in (extra_tags or []):
+    if t and t not in tags:
+      tags.append(t)
+  payload = {
+    'full_name': full,
+    'stargazers_count': repo_obj.get('stargazers_count') or 0,
+    'forks_count': repo_obj.get('forks_count') or 0,
+    'pushed_at': repo_obj.get('pushed_at') or '',
+    'topics': repo_obj.get('topics') or [],
+  }
+  if extra_payload:
+    payload.update(extra_payload)
+  return RawApp(
+    source=source,
+    external_id=full,
+    name=(repo_obj.get('name') or full.split('/')[-1])[:200],
+    website_url=_clean_url(repo_obj.get('homepage')),
+    repo_url=repo_obj.get('html_url') or f'https://github.com/{full}',
+    icon_url=avatar,
+    description=(repo_obj.get('description') or '').strip()[:2000],
+    license=lic,
+    language=repo_obj.get('language') or '',
+    raw_tags=tags,
+    stars=int(repo_obj.get('stargazers_count') or 0),
+    forks=int(repo_obj.get('forks_count') or 0),
+    last_commit_at=str(repo_obj.get('pushed_at') or ''),
+    archived=bool(repo_obj.get('archived')),
+    source_url=source_url,
+    raw_payload=payload,
+  )
+
+
+def _strip_tags(raw):
+  return html.unescape(re.sub(r'<[^>]+>', ' ', raw or '')).strip()
+
+
+def _parse_int(s):
+  digits = re.sub(r'[^\d]', '', s or '')
+  return int(digits) if digits else 0
+
+
+def _parse_trending_html(page_html, since='daily'):
+  """Parse ``github.com/trending`` HTML rows into normalized dicts."""
+  rows = []
+  for block in re.findall(r'<article[^>]*class="[^"]*Box-row[^"]*"[^>]*>(.*?)</article>', page_html, re.S):
+    m = re.search(r'<h2[^>]*>.*?<a[^>]*href="/([^"/]+/[^"/#?]+)"', block, re.S)
+    if not m:
+      continue
+    full = m.group(1).strip()
+    desc_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.S)
+    desc = re.sub(r'\s+', ' ', _strip_tags(desc_m.group(1))) if desc_m else ''
+    lang_m = re.search(r'itemprop="programmingLanguage"[^>]*>(.*?)<', block, re.S)
+    lang = _strip_tags(lang_m.group(1)) if lang_m else ''
+    stars_m = re.search(r'href="/[^"]+/stargazers"[^>]*>(.*?)</a>', block, re.S)
+    forks_m = re.search(r'href="/[^"]+/forks"[^>]*>(.*?)</a>', block, re.S)
+    period_m = re.search(r'([\d,]+)\s+stars\s+(?:today|this week|this month)', block, re.I)
+    rows.append({
+      'full_name': full,
+      'description': desc,
+      'language': lang,
+      'stars': _parse_int(stars_m.group(1)) if stars_m else 0,
+      'forks': _parse_int(forks_m.group(1)) if forks_m else 0,
+      'stars_period': _parse_int(period_m.group(1)) if period_m else 0,
+      'since': since,
+    })
+  return rows
+
+
+class GitHubTrending:
+  """``github.com/trending`` (daily + weekly), enriched via GitHub REST when a token exists."""
+
+  name = 'gh_trending'
+  BASE = 'https://github.com/trending'
+
+  def __init__(self, sinces=('daily', 'weekly'), enrich=True):
+    self.sinces = sinces
+    self.enrich = enrich
+
+  def collect(self):
+    seen = {}
+    for since in self.sinces:
+      url = f'{self.BASE}?since={urllib.parse.quote(since)}'
+      raw_html = fetch(url, timeout=30).decode('utf-8', errors='replace')
+      for row in _parse_trending_html(raw_html, since=since):
+        fn = row['full_name']
+        if fn not in seen:
+          seen[fn] = row
+        else:
+          seen[fn].setdefault('also_since', []).append(since)
+
+    meta = {}
+    if self.enrich and _gh_token() and seen:
+      def _fetch_one(fn):
+        try:
+          return fn, _gh_json(f'https://api.github.com/repos/{fn}', timeout=15)
+        except Exception:
+          return fn, None
+
+      with ThreadPoolExecutor(max_workers=4) as pool:
+        for fn, obj in pool.map(_fetch_one, seen.keys()):
+          if obj:
+            meta[fn] = obj
+
+    for fn, row in seen.items():
+      extra = {'since': row['since'], 'stars_period': row['stars_period']}
+      if fn in meta:
+        yield _gh_raw_from_repo(
+          meta[fn], self.name, fn, f'https://github.com/trending?since={row["since"]}',
+          extra_tags=['github-trending'], extra_payload=extra,
+        )
+      else:
+        owner, repo = fn.split('/', 1)
+        yield RawApp(
+          source=self.name,
+          external_id=fn,
+          name=repo,
+          repo_url=f'https://github.com/{fn}',
+          icon_url=f'https://github.com/{owner}.png?size=64',
+          description=row['description'],
+          language=row['language'],
+          raw_tags=['github-trending'],
+          stars=row['stars'],
+          forks=row['forks'],
+          source_url=f'https://github.com/trending?since={row["since"]}',
+          raw_payload=row,
+        )
+
+
+class GitHubPopular:
+  """GitHub Search API for popular self-hosted and breakout repositories."""
+
+  name = 'gh_popular'
+  SEARCH_API = 'https://api.github.com/search/repositories'
+
+  def __init__(self, queries=None):
+    self.queries = queries
+
+  def _default_queries(self):
+    recent = (date.today() - timedelta(days=90)).isoformat()
+    return [
+      ('topic:self-hosted stars:>=500', 1),
+      ('topic:self-hosted stars:>=500', 2),
+      ('topic:selfhosted stars:>=300', 1),
+      ('stars:>=25000', 1),
+      (f'created:>={recent} stars:>=1000', 1),
+    ]
+
+  def collect(self):
+    seen = {}
+    for q, page in (self.queries or self._default_queries()):
+      qs = urllib.parse.urlencode({'q': q, 'sort': 'stars', 'order': 'desc', 'per_page': 100, 'page': page})
+      data = _gh_json(f'{self.SEARCH_API}?{qs}', timeout=30)
+      for item in data.get('items') or []:
+        fn = item.get('full_name')
+        if fn and fn not in seen:
+          seen[fn] = (item, q)
+    for fn, (item, q) in seen.items():
+      yield _gh_raw_from_repo(
+        item, self.name, fn,
+        f'https://github.com/search?q={urllib.parse.quote(q)}&type=repositories',
+        extra_tags=['github-popular'], extra_payload={'query': q},
+      )
+
+
+ADAPTERS = {
+  AwesomeSelfhosted.name: AwesomeSelfhosted,
+  SelfhSt.name: SelfhSt,
+  GitHubTrending.name: GitHubTrending,
+  GitHubPopular.name: GitHubPopular,
+}
+
+PLANNED_SOURCES = ()
 
 
 def get(name):

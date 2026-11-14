@@ -72,19 +72,25 @@ class PB:
     return r.get('totalItems', 0)
 
   def import_records(self, coll, rows):
-    """Bulk create/update: one request instead of one per record."""
+    """Create or update records via upsert (PocketBase >=0.23 removed /import)."""
     if not rows:
       return 0
-    out = 0
-    for i in range(0, len(rows), 500):
-      chunk = rows[i:i + 500]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(r):
       try:
-        self._req('POST', f'/api/collections/{coll}/import', chunk)
-        out += len(chunk)
+        self.upsert(coll, r, rid=r.get('id'))
+        return 1
       except RuntimeError as e:
         if '-> 429' in str(e):
           raise
-        print(f'  import {coll} chunk {i} failed: {e}', file=sys.stderr, flush=True)
+        print(f'  upsert {coll} failed: {e}', file=sys.stderr, flush=True)
+        return 0
+
+    out = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+      for n in pool.map(_one, rows):
+        out += n
     return out
 
   def upsert(self, coll, body, rid=None):
@@ -117,7 +123,7 @@ def run(db, merged, today=None, dry_run=False, workers=1):
   from .merge import activity_status, delta, is_star_surge
 
   existing = {r['canonical_key']: r
-              for r in db.all('projects', fields='id,canonical_key,slug,latest_release_tag,archived,first_seen_at')}
+              for r in db.all('projects', fields='id,canonical_key,slug,latest_release_tag,archived,first_seen_at,sources,unified_tags,stars,activity_status')}
   entry_keys = {(r['source'], r['external_id']) for r in db.all('source_entries', fields='source,external_id')}
   snap_keys = {(r['project'], r['captured_date'])
                for r in db.all('repo_snapshots', fields='project,captured_date')}
@@ -167,15 +173,32 @@ def run(db, merged, today=None, dry_run=False, workers=1):
         rows_ev.append(_event(pid, 'archived_or_stale', 'awesome', f'{p["name"]} archived', {}, today))
       d1, d7, d30 = delta(sorted(prev_stars.get(pid, []) + [(date.fromisoformat(today), p['stars'])]),
                           date.fromisoformat(today))
-      rows_upd.append({'id': pid, 'stars_1d_delta': d1, 'stars_7d_delta': d7,
-                       'stars_30d_delta': d30, 'last_synced_at': today})
+      old_srcs = set(old.get('sources') or [])
+      for src in ('gh_trending', 'gh_popular'):
+        if src in p['sources'] and src not in old_srcs:
+          rows_ev.append(_event(pid, f'new_in_{src}', src, f'{p["name"]} added to {src}', {'source': src}, today))
+      changed = (
+        list(old.get('sources') or []) != p['sources']
+        or list(old.get('unified_tags') or []) != p['unified_tags']
+        or int(old.get('stars') or 0) != p['stars']
+        or (old.get('activity_status') or '') != p['activity_status']
+      )
+      if changed:
+        rows_upd.append({
+          'id': pid,
+          'sources': p['sources'], 'unified_tags': p['unified_tags'],
+          'stars': p['stars'], 'forks': p['forks'], 'activity_status': p['activity_status'],
+          'last_commit_at': p['last_commit_at'] or None,
+          'stars_1d_delta': d1, 'stars_7d_delta': d7,
+          'stars_30d_delta': d30, 'last_synced_at': today,
+        })
       if is_star_surge(d7):
-        rows_ev.append(_event(pid, 'star_surge', 'selfhst' if 'selfhst' in p['sources'] else 'awesome',
+        rows_ev.append(_event(pid, 'star_surge', 'selfhst' if 'selfhst' in p['sources'] else p['sources'][0],
                               f'{p["name"]} +{d7} stars in 7 days', {'delta_7d': d7, 'stars': p['stars']}, today))
     else:
       for src in p['sources']:
-        rows_ev.append(_event(pid, 'new_in_awesome' if src == 'awesome' else 'new_in_selfhst', src,
-                              f'{p["name"]} added to {src}', {'source': src}, today))
+        etype = f'new_in_{src}' if src in ('awesome', 'selfhst', 'gh_trending', 'gh_popular') else 'new_in_awesome'
+        rows_ev.append(_event(pid, etype, src, f'{p["name"]} added to {src}', {'source': src}, today))
     for e in g['sources']:
       if (e.source, e.external_id) in entry_keys:
         continue
@@ -196,8 +219,16 @@ def run(db, merged, today=None, dry_run=False, workers=1):
   stats['pending_snapshots'] = len(rows_s)
   stats['pending_events'] = len(rows_ev)
   stats['pending_updates'] = len(rows_upd)
-  _stash(db, {'projects': rows_upd, 'source_entries': rows_e,
-              'repo_snapshots': rows_s, 'surveillance_events': rows_ev})
+  if getattr(db, 'stash_path', None):
+    _stash(db, {'projects': rows_upd, 'source_entries': rows_e,
+                'repo_snapshots': rows_s, 'surveillance_events': rows_ev})
+  else:
+    if rows_upd:
+      db.import_records('projects', rows_upd)
+    if rows_e and len(rows_e) <= 600:
+      db.import_records('source_entries', rows_e)
+    if rows_ev and len(rows_ev) <= 600:
+      db.import_records('surveillance_events', rows_ev)
   return stats
 
 

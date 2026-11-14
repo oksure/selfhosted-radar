@@ -83,11 +83,13 @@ def stage(db_path, merged, today, base_id=0, verbose=True):
 
     snaps = sorted(prev_stars.get(pid, []) + [(td, p['stars'])])
     d1, d7, d30 = delta(snaps, td)
-    cur.execute('''UPDATE projects SET stars=?, forks=?, selfhst_trending=?, last_commit_at=?,
+    cur.execute('''UPDATE projects SET sources=?, unified_tags=?, stars=?, forks=?, selfhst_trending=?, last_commit_at=?,
         latest_release_tag=?, latest_release_at=?, archived=?, activity_status=?, last_synced_at=?,
         stars_1d_delta=?, stars_7d_delta=?, stars_30d_delta=?
         WHERE id=?''',
-                (p['stars'], p['forks'], p['selfhst_trending'], p['last_commit_at'],
+                (json.dumps(p['sources'], ensure_ascii=False),
+                 json.dumps(p['unified_tags'], ensure_ascii=False),
+                 p['stars'], p['forks'], p['selfhst_trending'], p['last_commit_at'],
                  p['latest_release_tag'], p['latest_release_at'], 1 if p['archived'] else 0,
                  p['activity_status'], today, d1, d7, d30, pid))
 
@@ -115,15 +117,23 @@ def stage(db_path, merged, today, base_id=0, verbose=True):
     evs = []
     if fresh:
       for src in p['sources']:
-        evs.append(('new_in_awesome' if src == 'awesome' else 'new_in_selfhst', src,
-                    f'{p["name"]} added to {src}', {'source': src}))
+        etype = f'new_in_{src}' if src in ('awesome', 'selfhst', 'gh_trending', 'gh_popular') else 'new_in_awesome'
+        evs.append((etype, src, f'{p["name"]} added to {src}', {'source': src}))
     else:
-      old = cur.execute('SELECT latest_release_tag, archived FROM projects WHERE id=?', (pid,)).fetchone()
+      old = cur.execute('SELECT latest_release_tag, archived, sources FROM projects WHERE id=?', (pid,)).fetchone()
+      if old:
+        try:
+          old_srcs = set(json.loads(old[2] or '[]'))
+        except ValueError:
+          old_srcs = set()
+        for src in ('gh_trending', 'gh_popular'):
+          if src in p['sources'] and src not in old_srcs:
+            evs.append((f'new_in_{src}', src, f'{p["name"]} added to {src}', {'source': src}))
       if p['latest_release_tag'] and old and old[0] != p['latest_release_tag']:
         evs.append(('new_release', 'awesome', f'{p["name"]} released {p["latest_release_tag"]}',
                     {'previous': old[0], 'current': p['latest_release_tag']}))
     if is_star_surge(d7):
-      evs.append(('star_surge', 'selfhst' if 'selfhst' in p['sources'] else 'awesome',
+      evs.append(('star_surge', 'selfhst' if 'selfhst' in p['sources'] else p['sources'][0],
                   f'{p["name"]} +{d7} stars in 7 days', {'delta_7d': d7, 'stars': p['stars']}))
     for etype, src, title, detail in evs:
       if (pid, etype, today) in seen_events:

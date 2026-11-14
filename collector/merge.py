@@ -53,11 +53,14 @@ def merge(entries):
     rows = groups[key]
     aw = next((r for r in rows if r.source == 'awesome'), None)
     sh = next((r for r in rows if r.source == 'selfhst'), None)
+    ghp = next((r for r in rows if r.source == 'gh_popular'), None)
+    ght = next((r for r in rows if r.source == 'gh_trending'), None)
     first = rows[0]
-    name = _pick(aw and aw.name, sh and sh.name, first.name)
-    repo_url = _pick(aw and aw.repo_url, sh and sh.repo_url, first.repo_url)
+    name = _pick(aw and aw.name, sh and sh.name, ghp and ghp.name, ght and ght.name, first.name)
+    repo_url = _pick(aw and aw.repo_url, sh and sh.repo_url, ghp and ghp.repo_url, ght and ght.repo_url, first.repo_url)
     tags = []
-    for r in sorted(rows, key=lambda r: 0 if r.source == 'awesome' else 1):
+    _order = {'awesome': 0, 'selfhst': 1, 'gh_popular': 2, 'gh_trending': 3}
+    for r in sorted(rows, key=lambda r: _order.get(r.source, 9)):
       for t in r.raw_tags:
         if t and t not in tags:
           tags.append(t)
@@ -81,13 +84,13 @@ def merge(entries):
       'name': name,
       'repo_full_name': _repo_full(repo_url),
       'repo_host': repo_host(repo_url),
-      'homepage_url': _pick(aw and aw.website_url, sh and sh.website_url),
+      'homepage_url': _pick(aw and aw.website_url, sh and sh.website_url, ghp and ghp.website_url, ght and ght.website_url, first.website_url),
       'repo_url': repo_url,
       'demo_url': _pick(aw and aw.demo_url),
-      'icon_url': _pick(aw and aw.icon_url, sh and sh.icon_url),
-      'description': _pick(aw and aw.description, sh and sh.description),
-      'license': _pick(sh and sh.license, aw and aw.license),
-      'language': _pick(sh and sh.language, aw and aw.language),
+      'icon_url': _pick(aw and aw.icon_url, sh and sh.icon_url, ghp and ghp.icon_url, ght and ght.icon_url, first.icon_url),
+      'description': _pick(aw and aw.description, sh and sh.description, ghp and ghp.description, ght and ght.description, first.description),
+      'license': _pick(sh and sh.license, aw and aw.license, ghp and ghp.license, ght and ght.license, first.license),
+      'language': _pick(sh and sh.language, aw and aw.language, ghp and ghp.language, ght and ght.language, first.language),
       'platforms': platforms,
       'unified_tags': tags,
       'sources': sorted({r.source for r in rows}),
@@ -97,7 +100,7 @@ def merge(entries):
       'stars_7d_delta': 0,
       'stars_30d_delta': 0,
       'selfhst_trending': trending,
-      'last_commit_at': _pick(sh and sh.last_commit_at, aw and aw.last_commit_at),
+      'last_commit_at': _pick(sh and sh.last_commit_at, aw and aw.last_commit_at, ghp and ghp.last_commit_at, ght and ght.last_commit_at, first.last_commit_at),
       'latest_release_tag': _pick(aw and aw.latest_release_tag),
       'latest_release_at': _pick(aw and aw.latest_release_at),
       'archived': archived,

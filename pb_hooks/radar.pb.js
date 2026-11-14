@@ -65,6 +65,8 @@ routerAdd('GET', '/api/radar/summary', (e) => {
   let inBoth = 0
   let srcAwesome = 0
   let srcSelfhst = 0
+  let srcGhTrending = 0
+  let srcGhPopular = 0
   const act = { active: 0, slow: 0, stale: 0, archived: 0 }
   const stars = { lt500: 0, '500-5000': 0, gt5000: 0 }
   const rowIds = e.auth ? {} : null
@@ -90,8 +92,12 @@ routerAdd('GET', '/api/radar/summary', (e) => {
     }
     const hasA = srcs.includes('awesome')
     const hasS = srcs.includes('selfhst')
+    const hasGT = srcs.includes('gh_trending')
+    const hasGP = srcs.includes('gh_popular')
     if (hasA) srcAwesome++
     if (hasS) srcSelfhst++
+    if (hasGT) srcGhTrending++
+    if (hasGP) srcGhPopular++
     if (hasA && hasS) inBoth++
 
     const st = r.getString('activity_status')
@@ -119,6 +125,8 @@ routerAdd('GET', '/api/radar/summary', (e) => {
     bySource: {
       awesome: srcAwesome,
       selfhst: srcSelfhst,
+      gh_trending: srcGhTrending,
+      gh_popular: srcGhPopular,
       both: inBoth,
       any: rows.length,
     },
@@ -134,9 +142,7 @@ routerAdd('GET', '/api/radar/summary', (e) => {
   }
 
   if (!rawFlt) {
-    const seA = countOf('source_entries', 'source = "awesome"')
-    const seS = countOf('source_entries', 'source = "selfhst"')
-    body.entryCount = seA + seS
+    body.entryCount = countOf('source_entries', '1=1')
     body.events = countOf('surveillance_events', '1=1')
     $app.store().set('radar_summary', { at: now, body: body })
   }

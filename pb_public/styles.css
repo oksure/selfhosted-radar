@@ -200,6 +200,8 @@ table.tbl .qmarks { border-top: 0; padding-top: 4px; margin-top: 2px; }
 }
 .badge.a { color: #b48ce0; }
 .badge.s { color: #58c4c4; }
+.badge.gt { color: #f0883e; }
+.badge.gp { color: #58a6ff; }
 .badge.both { color: var(--accent); }
 .badge.arch { color: var(--bad); }
 .badge.slow { color: var(--warn); }
