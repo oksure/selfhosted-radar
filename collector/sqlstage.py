@@ -153,16 +153,29 @@ def stage(db_path, merged, today, base_id=0, verbose=True):
 
 def main(argv=None):
   import argparse
+  from dataclasses import asdict
   ap = argparse.ArgumentParser(prog='collector.sqlstage')
-  ap.add_argument('db_path')
+  ap.add_argument('db_path', nargs='?', default='')
   ap.add_argument('--today', default=date.today().isoformat())
   ap.add_argument('--dump', default='', help='also keep the merged JSON for auditing')
+  ap.add_argument('--collect-only', default='', help='collect all sources to JSON without touching a DB')
+  ap.add_argument('--from-collected', default='', help='load pre-collected RawApp JSON instead of fetching')
   a = ap.parse_args(argv)
-  rows = []
-  for name in sources.ADAPTERS:
-    got = list(sources.get(name).collect())
-    print(f'{name}: {len(got)}', flush=True)
-    rows += got
+  if a.from_collected:
+    rows = [sources.RawApp(**r) for r in json.load(open(a.from_collected, encoding='utf-8'))]
+  else:
+    rows = []
+    for name in sources.ADAPTERS:
+      got = list(sources.get(name).collect())
+      print(f'{name}: {len(got)}', flush=True)
+      rows += got
+  if a.collect_only:
+    with open(a.collect_only, 'w', encoding='utf-8') as ff:
+      json.dump([asdict(r) for r in rows], ff, ensure_ascii=False)
+    print(f'collected: {len(rows)} -> {a.collect_only}', flush=True)
+    return 0
+  if not a.db_path:
+    ap.error('db_path is required unless --collect-only is set')
   merged = merge(rows)
   if a.dump:
     with open(a.dump, 'w') as ff:

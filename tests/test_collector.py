@@ -257,3 +257,35 @@ def test_github_popular_and_merge_with_awesome(monkeypatch):
   assert p['sources'] == ['awesome', 'gh_popular']
   assert p['stars'] == 99000
   assert 'github-popular' in p['unified_tags']
+
+
+def test_github_popular_rest_top_and_split(monkeypatch):
+  from collector import sources as S
+
+  def fake_search(q, page=1, per_page=100, timeout=30):
+    if q == 'stars:>=5000':
+      return {'total_count': 1200, 'items': []}
+    if q.startswith('stars:>=50001'):
+      return {'total_count': 1, 'items': [{
+        'full_name': 'top/one', 'name': 'one', 'html_url': 'https://github.com/top/one',
+        'homepage': 'https://one.dev', 'description': 'Top repo',
+        'stargazers_count': 90000, 'forks_count': 1000, 'pushed_at': '2026-11-14T00:00:00Z',
+        'archived': False, 'language': 'Rust', 'license': {'spdx_id': 'MIT'},
+        'owner': {'login': 'top', 'avatar_url': 'https://avatars.githubusercontent.com/u/1?v=4'},
+        'topics': ['cli'],
+      }]}
+    return {'total_count': 1, 'items': [{
+      'full_name': 'mid/two', 'name': 'two', 'html_url': 'https://github.com/mid/two',
+      'homepage': '', 'description': 'Mid repo',
+      'stargazers_count': 15000, 'forks_count': 200, 'pushed_at': '2026-11-14T00:00:00Z',
+      'archived': False, 'language': 'Go', 'license': {'spdx_id': 'Apache-2.0'},
+      'owner': {'login': 'mid', 'avatar_url': ''}, 'topics': [],
+    }]}
+
+  monkeypatch.setattr(S, '_gh_token', lambda: 'tok')
+  monkeypatch.setattr(S, '_gh_json', lambda url, timeout=30: {'items': []})
+  monkeypatch.setattr(S, '_gh_search_rest', fake_search)
+  rows = list(S.GitHubPopular(top_limit=2).collect())
+  assert [r.external_id for r in rows] == ['top/one', 'mid/two']
+  assert rows[0].stars == 90000 and rows[0].language == 'Rust'
+  assert rows[1].icon_url == 'https://github.com/mid.png?size=64'

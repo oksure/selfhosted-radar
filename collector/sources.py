@@ -9,7 +9,10 @@ import io
 import json
 import os
 import re
+import sys
 import tarfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -213,6 +216,46 @@ def _gh_json(url, timeout=30):
     return json.loads(r.read())
 
 
+def _gh_search_rest(q, page=1, per_page=100, timeout=30):
+  """Call GitHub Search REST API with rate-limit-aware pacing and retry."""
+  qs = urllib.parse.urlencode({'q': q, 'sort': 'stars', 'order': 'desc', 'per_page': per_page, 'page': page})
+  url = f'https://api.github.com/search/repositories?{qs}'
+  headers = {
+    'User-Agent': UA['User-Agent'],
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  }
+  tok = _gh_token()
+  if tok:
+    headers['Authorization'] = f'Bearer {tok}'
+  for attempt in range(4):
+    req = urllib.request.Request(url, headers=headers)
+    try:
+      with urllib.request.urlopen(req, timeout=timeout) as r:
+        rem = r.headers.get('X-RateLimit-Remaining')
+        rst = r.headers.get('X-RateLimit-Reset')
+        data = json.loads(r.read())
+      if rem is not None and int(rem) <= 2 and rst:
+        wait = max(1, int(rst) - int(time.time()) + 2)
+        time.sleep(min(wait, 65))
+      return data
+    except urllib.error.HTTPError as e:
+      if e.code in (403, 429) and attempt < 3:
+        rst = e.headers.get('X-RateLimit-Reset') if e.headers else None
+        wait = max(5, int(rst) - int(time.time()) + 2) if rst else 62
+        time.sleep(min(wait, 65))
+        continue
+      if e.code in (500, 502, 503, 504) and attempt < 3:
+        time.sleep(2 * (attempt + 1))
+        continue
+      raise
+    except (urllib.error.URLError, TimeoutError, OSError):
+      if attempt == 3:
+        raise
+      time.sleep(2 * (attempt + 1))
+  raise RuntimeError(f'GitHub search failed for {q} page={page}')
+
+
 def _clean_url(raw):
   v = (raw or '').strip()
   if not v:
@@ -361,25 +404,56 @@ class GitHubTrending:
 
 
 class GitHubPopular:
-  """GitHub Search API for popular self-hosted and breakout repositories."""
+  """GitHub Search REST (self-hosted topics + breakout + top 10,000 by stars)."""
 
   name = 'gh_popular'
   SEARCH_API = 'https://api.github.com/search/repositories'
 
-  def __init__(self, queries=None):
+  def __init__(self, queries=None, top_limit=10000):
     self.queries = queries
+    self.top_limit = top_limit
 
   def _default_queries(self):
     recent = (date.today() - timedelta(days=90)).isoformat()
-    qs = [
+    return [
       ('topic:self-hosted stars:>=500', 1),
       ('topic:self-hosted stars:>=500', 2),
       ('topic:selfhosted stars:>=300', 1),
       (f'created:>={recent} stars:>=1000', 1),
     ]
-    for page in range(1, 6):
-      qs.append(('stars:>=20000', page))
-    return qs
+
+  def _collect_top_rest(self, seen):
+    """Fetch top ``self.top_limit`` repos by stars via Search REST star-range buckets."""
+    stack = [(5000, None)]
+    while stack and len(seen) < self.top_limit:
+      lo, hi = stack.pop()
+      q = f'stars:>={lo}' if hi is None else f'stars:{lo}..{hi}'
+      data = _gh_search_rest(q, page=1, per_page=100)
+      total = int(data.get('total_count') or 0)
+      if total > 950 and (hi is None or lo < hi):
+        mid = max(lo + 1, 50000) if hi is None else (lo + hi) // 2
+        if hi is None or mid > lo:
+          stack.append((lo, mid))
+          stack.append((mid + 1, hi))
+          continue
+      pages = min(10, (total + 99) // 100) if total else 1
+      print(f'  gh_popular {q}: {total} repos ({pages} pages), collected={len(seen)}', file=sys.stderr, flush=True)
+      for page in range(1, pages + 1):
+        if page > 1:
+          data = _gh_search_rest(q, page=page, per_page=100)
+        items = data.get('items') or []
+        if not items:
+          break
+        for item in items:
+          fn = item.get('full_name')
+          if fn and fn not in seen:
+            seen[fn] = _gh_raw_from_repo(
+              item, self.name, fn,
+              f'https://github.com/search?q={urllib.parse.quote(q)}&type=repositories',
+              extra_tags=['github-popular'], extra_payload={'query': q},
+            )
+            if len(seen) >= self.top_limit:
+              return
 
   def collect(self):
     seen = {}
@@ -389,13 +463,14 @@ class GitHubPopular:
       for item in data.get('items') or []:
         fn = item.get('full_name')
         if fn and fn not in seen:
-          seen[fn] = (item, q)
-    for fn, (item, q) in seen.items():
-      yield _gh_raw_from_repo(
-        item, self.name, fn,
-        f'https://github.com/search?q={urllib.parse.quote(q)}&type=repositories',
-        extra_tags=['github-popular'], extra_payload={'query': q},
-      )
+          seen[fn] = _gh_raw_from_repo(
+            item, self.name, fn,
+            f'https://github.com/search?q={urllib.parse.quote(q)}&type=repositories',
+            extra_tags=['github-popular'], extra_payload={'query': q},
+          )
+    if self.queries is None and self.top_limit > 0 and _gh_token():
+      self._collect_top_rest(seen)
+    yield from seen.values()
 
 
 ADAPTERS = {
