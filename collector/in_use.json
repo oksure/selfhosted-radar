@@ -11,5 +11,19 @@
   "grafana-grafana",
   "meilisearch-meilisearch",
   "pocketbase-io-pocketbase-io-pocketbase",
-  "n8n-io-n8n"
+  "n8n-io-n8n",
+  "restic-restic",
+  "rclone-rclone",
+  "valkey-io-valkey",
+  "caddyserver-caddy",
+  "cloudflare-cloudflared",
+  "prometheus-prometheus",
+  "grafana-loki",
+  "google-cadvisor",
+  "traefik-traefik",
+  "twin-gatus",
+  "umami-software-umami",
+  "zulip-zulip",
+  "searxng-searxng",
+  "langfuse-langfuse"
 ]
