@@ -187,3 +187,11 @@ def test_selfhst_joins_software_and_metrics(monkeypatch):
   r = rows[0]
   assert (r.stars, r.forks, r.selfhst_trending) == (42, 3, 9)
   assert r.raw_tags == ['Automation'] and r.alternatives_refs == [52]
+
+
+def test_icon_slug_normalization():
+  from collector.sources import _selfhst_icon, _normalize_icon_url
+  assert _selfhst_icon({'icon_override': 'unsloth', 'reference': 'x'}) == 'https://cdn.jsdelivr.net/gh/selfhst/icons/png/unsloth.png'
+  assert _selfhst_icon({'icon_override': 'https://example.com/a.png'}) == 'https://example.com/a.png'
+  assert _normalize_icon_url('rahoot') == 'https://cdn.jsdelivr.net/gh/selfhst/icons/png/rahoot.png'
+  assert _normalize_icon_url('') == ''

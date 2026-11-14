@@ -11,7 +11,9 @@ const state = {
   q: '',
   preset: '',
   source: '',        // awesome | selfhst | both
+  inUse: false,
   tags: [],
+  showAllTags: false,
   lang: '',
   license: '',
   activity: '',      // '' (all) | active | slow | stale
@@ -44,6 +46,7 @@ function readUrl() {
   state.q = u.get('q') || '';
   state.preset = u.get('preset') || '';
   state.source = u.get('source') || '';
+  state.inUse = u.get('inuse') === '1' || state.preset === 'in-use';
   state.tags = (u.get('tag') || '').split(',').filter(Boolean);
   state.lang = u.get('lang') || '';
   state.license = u.get('license') || '';
@@ -64,6 +67,7 @@ function writeUrl(replace = false) {
   if (state.q) u.set('q', state.q);
   if (state.preset) u.set('preset', state.preset);
   if (state.source) u.set('source', state.source);
+  if (state.inUse && state.preset !== 'in-use') u.set('inuse', '1');
   if (state.tags.length) u.set('tag', state.tags.join(','));
   if (state.lang) u.set('lang', state.lang);
   if (state.license) u.set('license', state.license);
@@ -103,7 +107,7 @@ function filterString() {
   if (state.stars === 'lt500') parts.push('stars < 500');
   else if (state.stars === '500-5000') parts.push('stars >= 500 && stars < 5000');
   else if (state.stars === 'gt5000') parts.push('stars >= 5000');
-  if (state.preset === 'in-use') parts.push('unified_tags ~ "in-use"');
+  if (state.inUse || state.preset === 'in-use') parts.push('unified_tags ~ "in-use"');
   if (state.preset === 'surge') parts.push('stars_7d_delta >= 20');  // history builds from day 1
   if (state.preset === 'release' && !state.q) parts.push('latest_release_at != ""');
   if (state.preset === 'new') {
@@ -159,8 +163,54 @@ function badgeFor(p) {
   return out.join('');
 }
 
+// ---------- icons ----------
+function normalizeIconUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  const u = safeUrl(s);
+  if (u) return u;
+  if (/^[a-z0-9._-]+$/i.test(s)) return `https://cdn.jsdelivr.net/gh/selfhst/icons/png/${encodeURIComponent(s)}.png`;
+  return '';
+}
+
+function githubAvatarUrl(repoUrl) {
+  const m = String(repoUrl || '').match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/[^/]+/i);
+  return m ? `https://github.com/${encodeURIComponent(m[1])}.png?size=64` : '';
+}
+
+function iconFallbackHtml(name) {
+  const clean = String(name || '?').trim();
+  const words = clean.split(/[\s\-_/]+/).filter(Boolean);
+  const initials = words.length >= 2
+    ? (words[0][0] + words[1][0]).toUpperCase()
+    : clean.slice(0, 2).toUpperCase();
+  let h = 0;
+  for (let i = 0; i < clean.length; i++) h = (h * 31 + clean.charCodeAt(i)) % 360;
+  return `<div class="icon icon-fallback" style="--ic-h:${h}" aria-hidden="true">${esc(initials || '?')}</div>`;
+}
+
+window._radarIconErr = img => {
+  const fb = img.dataset.fb || '';
+  if (fb) {
+    img.dataset.fb = '';
+    img.src = fb;
+    return;
+  }
+  const tpl = document.createElement('template');
+  tpl.innerHTML = iconFallbackHtml(img.dataset.name || '');
+  img.replaceWith(tpl.content.firstChild);
+};
+
+function iconHtml(p) {
+  const primary = normalizeIconUrl(p.icon_url);
+  const gh = githubAvatarUrl(p.repo_url);
+  const src = primary || gh;
+  const fb = primary && gh && primary !== gh ? gh : '';
+  if (!src) return iconFallbackHtml(p.name);
+  return `<img class="icon" src="${esc(src)}" data-fb="${esc(fb)}" data-name="${esc(p.name)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="window._radarIconErr(this)">`;
+}
+
 function card(p) {
-  const icon = safeUrl(p.icon_url);
   const tags = arr(p.unified_tags)
     .filter(t => t !== 'in-use')
     .slice(0, 4)
@@ -171,7 +221,7 @@ function card(p) {
   const stCls = isStarred(cur) ? ' is-mark-watching' : '';
   return `<article class="card${stCls}" data-slug="${esc(p.slug)}" tabindex="0" role="button">
     <div class="card-top">
-      ${icon ? `<img class="icon" src="${esc(icon)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="icon"></div>'}
+      ${iconHtml(p)}
       <div style="min-width:0;flex:1">
         <h3>${esc(p.name)}</h3>
         <div class="badges">${badgeFor(p)}</div>
@@ -244,15 +294,59 @@ async function loadExplore() {
 function renderPager(d) {
   const pages = d.totalPages || 1;
   const p = d.page || 1;
-  $('#pager').innerHTML = pages <= 1 ? '' :
-    `<button data-p="${p - 1}" ${p <= 1 ? 'disabled' : ''}>← Prev</button>
-     <span class="count">Page ${p} of ${fmt(pages)}</span>
-     <button data-p="${p + 1}" ${p >= pages ? 'disabled' : ''}>Next →</button>`;
+  if (pages <= 1) { $('#pager').innerHTML = ''; return; }
+  const nums = new Set([1, pages]);
+  for (let i = Math.max(1, p - 2); i <= Math.min(pages, p + 2); i++) nums.add(i);
+  const sorted = [...nums].sort((a, b) => a - b);
+  let btns = `<button data-p="${p - 1}" ${p <= 1 ? 'disabled' : ''}>← Prev</button>`;
+  let prev = 0;
+  for (const n of sorted) {
+    if (n - prev > 1) btns += '<span class="pager-dots">…</span>';
+    btns += `<button data-p="${n}" class="${n === p ? 'is-on' : ''}" ${n === p ? 'aria-current="page"' : ''}>${fmt(n)}</button>`;
+    prev = n;
+  }
+  btns += `<button data-p="${p + 1}" ${p >= pages ? 'disabled' : ''}>Next →</button>`;
+  btns += `<form class="pager-jump" data-pages="${pages}"><span>Go to</span><input type="number" min="1" max="${pages}" value="${p}" aria-label="Jump to page"><span>/ ${fmt(pages)}</span><button type="submit">Go</button></form>`;
+  $('#pager').innerHTML = btns;
+}
+
+let lastSummary = null;
+function renderFacets(s) {
+  if (!s) return;
+  const box = (title, name, opts, sel, extra = '') => `<div class="facet"><h3>${title}</h3>` + opts.map(([v, label, n]) =>
+    `<label title="${esc(label)}"><input type="checkbox" data-facet="${name}" value="${esc(v)}" ${sel.includes(v) ? 'checked' : ''}><span class="facet-lbl">${esc(label)}</span>${n != null ? `<span class="n">${fmt(n)}</span>` : ''}</label>`).join('') + extra + '</div>';
+
+  const starredTotal = state.auth ? Object.values(state.curation).filter(isStarred).length : null;
+  const inUseOn = state.inUse || state.preset === 'in-use';
+  const starredOn = state.markFilter === 'starred' || state.preset === 'starred';
+  let html = `<div class="facet"><h3>My List</h3>` +
+    `<label title="In Use"><input type="checkbox" data-facet="inuse" value="1" ${inUseOn ? 'checked' : ''}><span class="facet-lbl">In Use</span>${s.inUse != null ? `<span class="n">${fmt(s.inUse)}</span>` : ''}</label>` +
+    `<label title="Starred"><input type="checkbox" data-facet="mark" value="starred" ${starredOn ? 'checked' : ''}><span class="facet-lbl">Starred</span><span class="n">${starredTotal != null ? fmt(starredTotal) : 'sign in'}</span></label>` +
+    `</div>`;
+
+  const src = [['awesome', 'awesome-selfhosted'], ['selfhst', 'selfh.st'], ['both', 'In both']];
+  html += `<div class="facet"><h3>Source</h3>` + src.map(([v, l]) =>
+    `<label title="${esc(l)}"><input type="radio" name="source" data-facet="source" value="${v}" ${state.source === v ? 'checked' : ''}><span class="facet-lbl">${l}</span></label>`).join('') +
+    `<label title="Any"><input type="radio" name="source" data-facet="source" value="" ${!state.source ? 'checked' : ''}><span class="facet-lbl">Any</span></label></div>`;
+  const actOrder = ['active', 'slow', 'stale', 'archived'];
+  html += box('Activity', 'activity',
+    actOrder.filter(k => k in (s.activity || {})).map(k => [k, k, s.activity[k]]), [state.activity]);
+  html += box('Stars', 'stars', [['lt500', '< 500'], ['500-5000', '500 – 5,000'], ['gt5000', '5,000+']], [state.stars]);
+  html += box('Language', 'lang', (s.topLanguages || []).slice(0, 12).map(x => [x.value, x.value, x.count]), [state.lang]);
+  html += box('License', 'license', (s.topLicenses || []).slice(0, 10).map(x => [x.value, x.value, x.count]), [state.license]);
+  const allTags = (s.topTags || []).filter(x => x.value !== 'in-use');
+  const shownTags = state.showAllTags ? allTags : allTags.slice(0, 12);
+  const moreBtn = allTags.length > 12
+    ? `<button type="button" id="tags-more" class="link more">${state.showAllTags ? 'Show fewer' : `Show all (${allTags.length})`}</button>`
+    : '';
+  html += box('Tags', 'tag', shownTags.map(x => [x.value, x.value, x.count]), state.tags, moreBtn);
+  $('#facet-body').innerHTML = html;
 }
 
 async function loadFacets() {
   try {
     const s = await fetch('/api/radar/summary').then(r => r.json());
+    lastSummary = s;
     const stat = [
       `<span><b>${fmt(s.total)}</b> apps</span>`,
       `<span><b>${fmt(s.inBoth)}</b> in both directories</span>`,
@@ -261,29 +355,7 @@ async function loadFacets() {
       s.lastSyncedAt ? `<span>synced <b>${esc(s.lastSyncedAt)}</b></span>` : '',
     ].filter(Boolean).join('');
     $('#statline').innerHTML = stat;
-
-    const box = (title, name, opts, sel) => `<div class="facet"><h3>${title}</h3>` + opts.map(([v, label, n]) =>
-      `<label><input type="checkbox" data-facet="${name}" value="${esc(v)}" ${sel.includes(v) ? 'checked' : ''}>${esc(label)}${n != null ? `<span class="n">${fmt(n)}</span>` : ''}</label>`).join('') + '</div>';
-
-    const src = [['awesome', 'awesome-selfhosted'], ['selfhst', 'selfh.st'], ['both', 'In both']];
-    let html = `<div class="facet"><h3>Source</h3>` + src.map(([v, l]) =>
-      `<label><input type="radio" name="source" data-facet="source" value="${v}" ${state.source === v ? 'checked' : ''}>${l}</label>`).join('') +
-      `<label><input type="radio" name="source" data-facet="source" value="" ${!state.source ? 'checked' : ''}>Any</label></div>`;
-    const actOrder = ['active', 'slow', 'stale', 'archived'];
-    html += box('Activity', 'activity',
-      actOrder.filter(k => k in (s.activity || {})).map(k => [k, k, s.activity[k]]), [state.activity]);
-    html += box('Stars', 'stars', [['lt500', '< 500'], ['500-5000', '500 – 5,000'], ['gt5000', '5,000+']], [state.stars]);
-    html += box('Language', 'lang', (s.topLanguages || []).slice(0, 12).map(x => [x.value, x.value, x.count]), [state.lang]);
-    html += box('License', 'license', (s.topLicenses || []).slice(0, 10).map(x => [x.value, x.value, x.count]), [state.license]);
-    if (state.auth) {
-      const starredTotal = Object.values(state.curation).filter(isStarred).length;
-      html += box('Saved', 'mark', [
-        ['starred', 'Starred', starredTotal],
-      ], [state.markFilter]);
-    }
-    html += box('Tags', 'tag', (s.topTags || []).map(x => [x.value, x.value, x.count]), state.tags);
-    $('#facet-body').innerHTML = html;
-
+    renderFacets(s);
   } catch (e) {
     $('#statline').textContent = 'Summary unavailable.';
   }
@@ -311,8 +383,13 @@ async function openDetail(slug, push = true) {
       ? arr(p.unified_tags).map(t => `<a class="tag" href="/?tag=${encodeURIComponent(t)}" data-close>${esc(t)}</a>`).join('')
       : '';
     body.innerHTML = `
-      <h2>${esc(p.name)}</h2>
-      <div class="badges">${badgeFor(p)}</div>
+      <div class="card-top" style="margin-bottom:8px">
+        ${iconHtml(p)}
+        <div style="min-width:0;flex:1">
+          <h2>${esc(p.name)}</h2>
+          <div class="badges">${badgeFor(p)}</div>
+        </div>
+      </div>
       <p class="muted">${esc(p.description)}</p>
       <div class="links">${links}</div>
       <section><h4>Numbers</h4><div class="nums">
@@ -486,8 +563,9 @@ function restoreAuth() {
 // ---------- wiring ----------
 function render() {
   if (state.view === 'explore') {
+    const activeChip = state.preset || (state.inUse ? 'in-use' : state.markFilter === 'starred' ? 'starred' : state.source === 'both' ? 'both' : '');
     document.querySelectorAll('#presets [data-preset]').forEach(c =>
-      c.classList.toggle('is-on', c.dataset.preset === state.preset));
+      c.classList.toggle('is-on', c.dataset.preset === activeChip));
   }
   if (state.view === 'radar') {
     $('#presets').innerHTML = ['', 'new_in_awesome', 'new_in_selfhst', 'new_release', 'star_surge', 'archived_or_stale']
@@ -521,7 +599,10 @@ function bind() {
     state.preset = b.dataset.preset;
     // "in both directories" is a source facet, everything else is its own filter
     state.source = state.preset === 'both' ? 'both' : '';
+    state.inUse = state.preset === 'in-use';
+    state.markFilter = state.preset === 'starred' ? 'starred' : '';
     document.querySelectorAll('#presets .chip').forEach(c => c.classList.toggle('is-on', c === b));
+    renderFacets(lastSummary);
     state.page = 1;
     render();
   });
@@ -536,15 +617,34 @@ function bind() {
     $('#view-table').classList.add('is-on'); $('#view-cards').classList.remove('is-on');
     render();
   });
+  $('#facet-body').addEventListener('click', e => {
+    if (e.target.id === 'tags-more') {
+      state.showAllTags = !state.showAllTags;
+      renderFacets(lastSummary);
+    }
+  });
   $('#facet-body').addEventListener('change', e => {
     const f = e.target.dataset.facet;
     if (!f) return;
-    if (f === 'source') { state.source = e.target.value; }
-    else if (f === 'tag') {
+    if (f === 'source') {
+      state.source = e.target.value;
+      if (state.preset === 'both' && state.source !== 'both') state.preset = '';
+    } else if (f === 'inuse') {
+      state.inUse = e.target.checked;
+      if (!state.inUse && state.preset === 'in-use') state.preset = '';
+    } else if (f === 'tag') {
       state.tags = [...document.querySelectorAll('[data-facet="tag"]:checked')].map(i => i.value);
-    } else if (f === 'activity' || f === 'stars' || f === 'mark') {
-      const key = f === 'mark' ? 'markFilter' : f;
-      state[key] = e.target.checked ? e.target.value : '';
+    } else if (f === 'mark') {
+      if (e.target.checked && !state.auth) {
+        e.target.checked = false;
+        $('#authdlg').showModal();
+        return;
+      }
+      state.markFilter = e.target.checked ? e.target.value : '';
+      if (!state.markFilter && state.preset === 'starred') state.preset = '';
+      document.querySelectorAll(`[data-facet="mark"]`).forEach(i => { if (i !== e.target) i.checked = false; });
+    } else if (f === 'activity' || f === 'stars') {
+      state[f] = e.target.checked ? e.target.value : '';
       document.querySelectorAll(`[data-facet="${f}"]`).forEach(i => { if (i !== e.target) i.checked = false; });
     } else {
       state[f] = e.target.checked ? e.target.value : '';
@@ -557,15 +657,27 @@ function bind() {
     $('#facet-toggle').setAttribute('aria-expanded', on ? 'true' : 'false');
   });
   $('#clear').addEventListener('click', () => {
-    Object.assign(state, { q: '', preset: '', source: '', tags: [], lang: '', license: '', activity: '', stars: '', markFilter: '', page: 1 });
+    Object.assign(state, { q: '', preset: '', source: '', inUse: false, tags: [], lang: '', license: '', activity: '', stars: '', markFilter: '', page: 1 });
     $('#q').value = '';
-    loadFacets();
+    renderFacets(lastSummary);
     render();
   });
   $('#pager').addEventListener('click', e => {
     const b = e.target.closest('button[data-p]');
     if (!b || b.disabled) return;
     state.page = Number(b.dataset.p);
+    render();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+  $('#pager').addEventListener('submit', e => {
+    const f = e.target.closest('.pager-jump');
+    if (!f) return;
+    e.preventDefault();
+    const maxP = Number(f.dataset.pages) || 1;
+    const inp = f.querySelector('input');
+    const n = Math.min(maxP, Math.max(1, parseInt(inp.value || '1', 10) || 1));
+    if (n === state.page) return;
+    state.page = n;
     render();
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });

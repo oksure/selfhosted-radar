@@ -67,6 +67,7 @@ routerAdd('GET', '/api/radar/summary', (e) => {
     bySource: bySource,
     entryCount: bySource.awesome + bySource.selfhst,
     inBoth: countOf('projects', 'sources ~ "awesome" && sources ~ "selfhst"'),
+    inUse: countOf('projects', 'unified_tags ~ "in-use"'),
     lastSyncedAt: lastSync,
     topTags: top(tags, 40),
     topLanguages: top(langs, 25),

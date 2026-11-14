@@ -55,8 +55,12 @@ def fetch(url, timeout=120):
 def _selfhst_icon(e):
   """selfh.st keeps its icon set in the selfhst/icons repo, keyed by reference."""
   override = e.get('icon_override')
-  if isinstance(override, str) and override.startswith('http'):
-    return override
+  if isinstance(override, str) and override.strip():
+    ov = override.strip()
+    if ov.startswith('http'):
+      return ov
+    if '/' not in ov and ':' not in ov:
+      return f'https://cdn.jsdelivr.net/gh/selfhst/icons/png/{ov}.png'
   ref = (e.get('reference') or '').strip()
   source = e.get('icon_source') or ''
   if not ref or source == 'None':
@@ -64,6 +68,17 @@ def _selfhst_icon(e):
   if source == 'Apps':
     return ''  # an app-store icon, not ours to mirror
   return f'https://cdn.jsdelivr.net/gh/selfhst/icons/png/{ref}.png'
+
+
+def _normalize_icon_url(raw):
+  v = (raw or '').strip()
+  if not v:
+    return ''
+  if v.startswith(('http://', 'https://')):
+    return v
+  if '/' not in v and ':' not in v:
+    return f'https://cdn.jsdelivr.net/gh/selfhst/icons/png/{v}.png'
+  return ''
 
 
 def _as_list(v):
@@ -117,7 +132,7 @@ class AwesomeSelfhosted:
         website_url=doc.get('website_url') or '',
         repo_url=doc.get('source_code_url') or '',
         demo_url=doc.get('demo_url') or '',
-        icon_url=doc.get('icon_url') or '',
+        icon_url=_normalize_icon_url(doc.get('icon_url')),
         description=doc.get('description') or '',
         license=lic,
         language=doc.get('language') or '',
