@@ -2,7 +2,6 @@
 import copy
 import http.client
 import stat
-import http.client
 import io
 import json
 import urllib.error
@@ -367,18 +366,18 @@ def test_transport_does_not_blindly_retry_mutations(monkeypatch, method):
   assert err.value.status == 502 and calls == [method]
 
 
-def test_get_retries_and_retry_after_are_bounded(monkeypatch):
-  calls, waits = [], []
+def test_get_retries_and_retry_after_are_bounded(monkeypatch, fake_clock):
+  calls = []
   def fail(req, timeout):
     calls.append(req.method)
     raise urllib.error.HTTPError(req.full_url, 429, 'limit', {'Retry-After': '99999'}, io.BytesIO(b'{}'))
   monkeypatch.setattr(W.urllib.request, 'urlopen', fail)
-  monkeypatch.setattr(W.time, 'sleep', waits.append)
   client = object.__new__(W.PB)
   client.base, client.token = 'https://example.invalid', None
   with pytest.raises(W.PBError):
     client._req('GET', '/records')
-  assert calls == ['GET'] * 3 and waits == [30, 30]
+  assert calls == ['GET'] * 3 and fake_clock.waits == [30, 30]
+  assert client.budget.http_attempts == 3
 
 
 def test_unconfirmed_empty_write_response_stays_pending(db, monkeypatch):
@@ -1300,3 +1299,326 @@ def test_directory_fsync_failure_reports_visible_but_uncertain_checkpoint(db, mo
   assert 'retained for replay' not in output.err
   resumed = W.flush(db)
   assert resumed['complete'] and resumed['events'] == 0
+
+
+class FakeClock:
+  def __init__(self):
+    self.now = 100.0
+    self.wall = 1800000000.0
+    self.waits = []
+
+  def advance(self, seconds):
+    self.now += seconds
+    self.wall += seconds
+
+  def sleep(self, seconds):
+    assert 0 < seconds <= 60
+    self.waits.append(seconds)
+    self.advance(seconds)
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+  clock = FakeClock()
+  monkeypatch.setattr(W.time, 'monotonic', lambda: clock.now)
+  monkeypatch.setattr(W.time, 'time', lambda: clock.wall)
+  monkeypatch.setattr(W.time, 'sleep', clock.sleep)
+  return clock
+
+
+def quota_headers(clock, remaining=0, seconds=120, scope='ip'):
+  prefix = f'X-PocketHost-RateLimit-{scope}-Hourly-'
+  return {prefix+'Limit': str(W.QUOTA_LIMITS[scope]), prefix+'Remaining': str(remaining),
+          prefix+'Reset': str(int(clock.wall + seconds))}
+
+
+class HTTPResponse(io.BytesIO):
+  def __init__(self, body=None, headers=None):
+    super().__init__(json.dumps(body if body is not None else {}).encode())
+    self.headers = headers or {}
+
+
+def transport_client(seconds=14400):
+  client = object.__new__(W.PB)
+  client.base, client.token = 'https://example.invalid', None
+  client.budget = W.RuntimeBudget(seconds)
+  return client
+
+
+@pytest.mark.parametrize('scope', ['ip', 'instance'])
+@pytest.mark.parametrize('status', [200, 429])
+def test_health_prime_waits_before_single_login(monkeypatch, fake_clock, scope, status):
+  calls = []
+  def respond(req, timeout):
+    calls.append((req.method, req.full_url, fake_clock.now, timeout))
+    if req.method == 'GET':
+      assert req.get_header('Authorization') is None
+      headers = quota_headers(fake_clock, remaining=10, scope=scope)
+      if status == 429:
+        raise urllib.error.HTTPError(req.full_url, 429, 'private', headers, io.BytesIO(b'{}'))
+      return HTTPResponse(headers=headers)
+    return HTTPResponse({'token': 'synthetic'})
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  client = W.PB('https://test.pockethost.io', 'synthetic', 'synthetic')
+  assert [(c[0], c[2]) for c in calls] == [('GET', 100), ('POST', 222)]
+  assert calls[0][1].endswith('/api/health') and calls[1][1].endswith('/auth-with-password')
+  assert fake_clock.waits == [60, 60, 2]
+  assert client.budget.report()['http_attempts'] == 2
+  assert client.budget.report()['quota_waits'] == 1
+  assert client.budget.report()['quota_wait_seconds'] == 122
+
+
+def test_non_pockethost_login_has_no_health_prime(monkeypatch, fake_clock):
+  calls = []
+  def respond(req, timeout):
+    calls.append(req.method)
+    return HTTPResponse({'token': 'synthetic'})
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  client = W.PB('https://pockethost.io.example.invalid', 'synthetic', 'synthetic')
+  assert calls == ['POST'] and client.budget.http_attempts == 1
+
+
+def test_multiple_windows_debit_headerless_attempts_and_wait_for_both_scopes(monkeypatch, fake_clock):
+  calls = []
+  client = transport_client()
+  def respond(req, timeout):
+    calls.append((req.method, fake_clock.now))
+    if len(calls) == 1:
+      return HTTPResponse(headers=quota_headers(fake_clock, remaining=11, seconds=100))
+    if len(calls) == 3:
+      return HTTPResponse(headers={**quota_headers(fake_clock, seconds=120),
+        **quota_headers(fake_clock, seconds=180, scope='instance')})
+    return HTTPResponse()
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  for method in ('GET', 'POST', 'GET', 'PATCH'):
+    client._req(method, '/records')
+  assert calls == [('GET', 100), ('POST', 100), ('GET', 202), ('PATCH', 384)]
+  assert client.budget.http_attempts == 4 and client.budget.quota_waits == 2
+  assert sum(fake_clock.waits) == client.budget.quota_wait_seconds == 284
+  assert max(fake_clock.waits) <= 60
+
+
+@pytest.mark.parametrize('remaining,reset', [('-1', 'valid'), ('1001', 'valid'),
+  ('1.5', 'valid'), ('NaN', 'valid'), ('0', 'missing'), ('0', 'past'),
+  ('0', 'distant'), ('0', 'NaN'), ('0', 'infinity'), ('0', '99999999999999999999'),
+  ('0', '+1800000120'), ('0', '1800000120.0'), ('0', ' 1800000120'), ('０', 'valid')])
+def test_malformed_quota_headers_never_cause_wait(monkeypatch, fake_clock, remaining, reset):
+  client = transport_client()
+  values = {'valid': str(int(fake_clock.wall + 120)), 'past': str(int(fake_clock.wall - 1)),
+            'distant': str(int(fake_clock.wall + 3601))}
+  headers = {'X-PocketHost-RateLimit-IP-Hourly-Limit': '1000',
+             'X-PocketHost-RateLimit-IP-Hourly-Remaining': remaining,
+             'X-PocketHost-RateLimit-IP-Hourly-Reset': values.get(reset, reset)}
+  if reset == 'missing':
+    del headers['X-PocketHost-RateLimit-IP-Hourly-Reset']
+  monkeypatch.setattr(W.urllib.request, 'urlopen', lambda *args, **kwargs: HTTPResponse(headers=headers))
+  client._req('GET', '/records')
+  client._req('POST', '/records')
+  assert fake_clock.waits == [] and client.budget.http_attempts == 2
+
+
+def test_case_insensitive_scoped_headers_and_maximum_horizon(monkeypatch, fake_clock):
+  client = transport_client()
+  client.budget.observe({'x-pockethost-ratelimit-instance-hourly-limit': '10000',
+                         'X-POCKETHOST-RATELIMIT-INSTANCE-HOURLY-REMAINING': '0',
+                         'X-POCKETHOST-RATELIMIT-INSTANCE-HOURLY-RESET': str(int(fake_clock.wall + 3600))})
+  monkeypatch.setattr(W.urllib.request, 'urlopen', lambda *args, **kwargs: HTTPResponse())
+  client._req('GET', '/records')
+  assert client.budget.http_attempts == 1
+  assert len(fake_clock.waits) == 61 and sum(fake_clock.waits) == 3602
+
+
+def test_quota_wait_uses_monotonic_time_across_wall_clock_jump(monkeypatch, fake_clock):
+  client = transport_client()
+  client.budget.observe(quota_headers(fake_clock, seconds=120))
+  fake_clock.wall += 100000
+  monkeypatch.setattr(W.urllib.request, 'urlopen', lambda *args, **kwargs: HTTPResponse())
+  client._req('GET', '/records')
+  assert fake_clock.now == 222 and sum(fake_clock.waits) == 122
+
+
+def test_insufficient_deadline_after_health_never_sends_login(monkeypatch, fake_clock):
+  budget = W.RuntimeBudget(120)
+  calls = []
+  def respond(req, timeout):
+    calls.append(req.method)
+    return HTTPResponse(headers=quota_headers(fake_clock, seconds=120))
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  with pytest.raises(W.RuntimeDeadlineExceeded):
+    W.PB('https://test.pockethost.io', 'synthetic', 'synthetic', budget=budget)
+  assert calls == ['GET'] and fake_clock.waits == []
+  assert budget.http_attempts == 1 and budget.report()['runtime_exhausted']
+
+
+def test_valid_get_429_retries_across_only_two_windows(monkeypatch, fake_clock):
+  client = transport_client()
+  calls = []
+  def respond(req, timeout):
+    calls.append(fake_clock.now)
+    raise urllib.error.HTTPError(req.full_url, 429, 'private',
+      quota_headers(fake_clock, seconds=120), io.BytesIO(b'{}'))
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  with pytest.raises(W.PBError):
+    client._req('GET', '/records')
+  assert calls == [100, 222, 344] and client.budget.http_attempts == 3
+  assert client.budget.quota_waits == 2 and sum(fake_clock.waits) == 244
+
+
+@pytest.mark.parametrize('method', ['POST', 'PUT', 'PATCH', 'DELETE'])
+@pytest.mark.parametrize('quota', [False, True])
+def test_mutation_429_never_waits_or_retries(monkeypatch, fake_clock, method, quota):
+  client = transport_client()
+  calls = []
+  def respond(req, timeout):
+    calls.append(req.method)
+    raise urllib.error.HTTPError(req.full_url, 429, 'private',
+      quota_headers(fake_clock) if quota else {'Retry-After': '120'}, io.BytesIO(b'{}'))
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  with pytest.raises(W.PBError) as error:
+    client._req(method, '/records', {'private': 'payload'})
+  assert error.value.status == 429 and calls == [method]
+  assert client.budget.http_attempts == 1 and fake_clock.waits == []
+
+
+@pytest.mark.parametrize('batch_size', [1, 50])
+@pytest.mark.parametrize('failure', ['429', 'timeout'])
+def test_transport_failures_preserve_journal_without_extra_write(db, monkeypatch, fake_clock, batch_size, failure):
+  journal = seed_plan(db, count=3)
+  original = Path(db.stash_path).read_bytes()
+  db.token, db.budget = None, W.RuntimeBudget(7)
+  real = db._req
+  calls, timeouts = [], []
+  def respond(req, timeout):
+    calls.append(req.method)
+    timeouts.append(timeout)
+    if req.method == 'GET':
+      return HTTPResponse({'items': []})
+    if failure == 'timeout':
+      fake_clock.advance(timeout)
+      raise TimeoutError('private timeout')
+    raise urllib.error.HTTPError(req.full_url, 429, 'private response',
+      quota_headers(fake_clock), io.BytesIO(b'{}'))
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  monkeypatch.setattr(db, '_req', W.PB._req.__get__(db))
+  stats = W.flush(db, batch_size=batch_size)
+  assert stats['errors'] == 1 and stats['confirmed_total'] == 0 and stats['pending'] == 3
+  assert calls == (['PATCH'] if batch_size == 1 else ['GET', 'POST'])
+  assert timeouts == [7] * len(calls) and fake_clock.waits == []
+  assert stats['http_attempts'] == len(calls)
+  assert Path(db.stash_path).read_bytes() == original and saved(db)['generation'] == journal['generation']
+  assert not Path(str(db.stash_path) + '.progress').exists()
+  # A later, explicit invocation reuses the same IDs and retains normal idempotence.
+  monkeypatch.setattr(db, '_req', real)
+  db.budget = W.RuntimeBudget()
+  assert W.flush(db)['complete']
+  assert W.flush(db)['attempted'] == 0 and len(db.rows['projects']) == 1
+
+
+def test_deadline_between_operations_retains_confirmed_prefix(db, monkeypatch, fake_clock):
+  seed_plan(db, count=3)
+  db.calls.clear()
+  db.budget = W.RuntimeBudget(5)
+  real = db.upsert
+  def slow(*args, **kwargs):
+    result = real(*args, **kwargs)
+    fake_clock.advance(5)
+    return result
+  monkeypatch.setattr(db, 'upsert', slow)
+  result = W.flush(db)
+  assert result['projects_created'] == result['confirmed_total'] == 1
+  assert result['pending'] == 2 and result['errors'] == 1 and saved(db)['next'] == 1
+  assert result['failure']['error_type'] == 'RuntimeDeadlineExceeded'
+  assert result['runtime_exhausted'] and len(db.calls) == 2
+
+
+@pytest.mark.parametrize('phase', ['collect', 'merge', 'plan_and_write'])
+def test_cli_deadline_checks_phases_and_retains_completed_drain(db, monkeypatch, fake_clock, capsys, phase):
+  W.run(db, groups(), today=TODAY, max_writes=1, requested_sources=['awesome'])
+  cli_setup(db, monkeypatch)
+  original = Path(db.stash_path).read_bytes()
+  if phase == 'collect':
+    real = W.flush
+    def slow(*args, **kwargs):
+      result = real(*args, **kwargs)
+      fake_clock.advance(5)
+      return result
+    monkeypatch.setattr(W, 'flush', slow)
+    monkeypatch.setattr(sync, 'collect', lambda names: pytest.fail('collect after deadline'))
+  elif phase == 'merge':
+    real = sync.collect
+    def slow(names):
+      rows = real(names)
+      fake_clock.advance(5)
+      return rows
+    monkeypatch.setattr(sync, 'collect', slow)
+    monkeypatch.setattr(sync, 'merge', lambda rows: pytest.fail('merge after deadline'))
+  else:
+    real = sync.merge
+    def slow(rows):
+      rows = real(rows)
+      fake_clock.advance(5)
+      return rows
+    monkeypatch.setattr(sync, 'merge', slow)
+    monkeypatch.setattr(W, 'run', lambda *args, **kwargs: pytest.fail('plan after deadline'))
+  assert sync.main(['--today', TODAY, '--sources', 'awesome', '--max-runtime-seconds', '5']) == 1
+  output = capsys.readouterr()
+  result = json.loads(output.out)
+  assert result['phase'] == phase and result['error_type'] == 'RuntimeDeadlineExceeded'
+  assert result['runtime_exhausted'] and result['attempted'] == 3
+  assert result['confirmed_total'] == result['drained_plan']['confirmed_total'] == 4
+  assert [result[k] for k in W.COUNTERS] == [0, 0, 1, 1, 1]
+  assert result['pending'] is None and Path(db.stash_path).read_bytes() == original
+
+
+@pytest.mark.parametrize('seconds', ['0', '-1', 'NaN', 'inf'])
+def test_cli_rejects_invalid_runtime_before_requests(db, monkeypatch, seconds):
+  cli_setup(db, monkeypatch)
+  with pytest.raises(SystemExit) as error:
+    sync.main(['--max-runtime-seconds', seconds])
+  assert error.value.code == 2 and db.calls == []
+
+
+def test_real_transport_drain_spans_windows_counts_404s_and_remains_idempotent(db, monkeypatch, fake_clock):
+  real = db._req
+  calls = []
+  db.token, db.budget = None, W.RuntimeBudget()
+  def respond(req, timeout):
+    calls.append(req.method)
+    url = W.urllib.parse.urlsplit(req.full_url)
+    params = {k: v[0] for k, v in W.urllib.parse.parse_qs(url.query, keep_blank_values=True).items()}
+    for key in ('page', 'perPage'):
+      if key in params:
+        params[key] = int(params[key])
+    body = json.loads(req.data) if req.data else None
+    headers = quota_headers(fake_clock, remaining=11)
+    try:
+      result = real(req.method, url.path, body, params)
+    except W.PBError as error:
+      raise urllib.error.HTTPError(req.full_url, error.status, 'synthetic', headers, io.BytesIO(b'{}'))
+    return HTTPResponse(result, headers)
+  monkeypatch.setattr(W.urllib.request, 'urlopen', respond)
+  monkeypatch.setattr(db, '_req', W.PB._req.__get__(db))
+  result = W.run(db, groups(), today=TODAY)
+  assert result['complete'] and result['confirmed_total'] == 4
+  assert result['http_attempts'] == len(calls) == 12
+  assert result['quota_waits'] == 5 and sum(fake_clock.waits) == 610
+  assert calls.count('GET') == 6 and calls.count('PATCH') == 2 and calls.count('POST') == 4
+  writes = [m for m in calls if m != 'GET']
+  assert W.run(db, groups(), today=TODAY)['complete']
+  assert [m for m in calls if m != 'GET'] == writes
+  assert all(len(rows) == 1 for rows in db.rows.values())
+
+
+def test_planning_deadline_never_replaces_original_journal(db, monkeypatch, fake_clock):
+  assert W.run(db, groups(), today=TODAY)['complete']
+  original = Path(db.stash_path).read_bytes()
+  db.budget = W.RuntimeBudget(5)
+  real = W._plan
+  def slow(*args, **kwargs):
+    result = real(*args, **kwargs)
+    fake_clock.advance(5)
+    return result
+  monkeypatch.setattr(W, '_plan', slow)
+  with pytest.raises(W.RuntimeDeadlineExceeded):
+    W.run(db, groups(2), today=TODAY)
+  assert Path(db.stash_path).read_bytes() == original and saved(db)['next'] == 4

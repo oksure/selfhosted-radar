@@ -10,4 +10,4 @@ cd "$ROOT"
 source "$HOME/dotfiles/claude/hooks/agent-env.sh"
 
 exec python3 -m collector.sync --sources awesome,selfhst,gh_trending,gh_popular \
-  --max-writes 60000 --batch-size 50
+  --max-writes 60000 --batch-size 50 --max-runtime-seconds 14400

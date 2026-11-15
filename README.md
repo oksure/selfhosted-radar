@@ -69,7 +69,7 @@ The weekly runner is planned to retain its existing filename for compatibility
 but use the same API pipeline, **without powering down the database**:
 
 ```bash
-python3 -m collector.sync --sources awesome,selfhst,gh_trending,gh_popular --max-writes 60000 --batch-size 50
+python3 -m collector.sync --sources awesome,selfhst,gh_trending,gh_popular --max-writes 60000 --batch-size 50 --max-runtime-seconds 14400
 ```
 
 Daily and weekly runners must use the same durable `--state-file` (or the same
@@ -147,12 +147,43 @@ must be object responses with an `items` list; malformed inventories cannot be
 treated as empty collections or replace the saved journal.
 
 `--max-writes N` changes the record-operation cap, not an HTTP-request allowance.
-In default serial mode a new record normally needs a PATCH/GET and a POST; an icon validation fallback
-can add one request. Reads retry transient HTTP errors at most twice, with
-Retry-After capped at 30 seconds; each HTTP request has a 30-second timeout.
-Mutations are never blindly retried. Run `--resume` manually in a later budget
-window; no automatic loop or HTTP quota estimate is provided. Large daily plans
-may need multiple invocations, and new collection waits until the saved plan finishes.
+In default serial mode a new record normally needs a PATCH/GET and a POST; an icon
+validation fallback can add one request. [PocketHost's limits](https://pockethost.io/docs/limits)
+are **1,000 requests per IP per hour** and **10,000 per instance per hour**.
+The client makes one unauthenticated `/api/health` GET on PocketHost before login
+to acquire quota headers; there are no recurring health probes. Valid scoped
+`X-PocketHost-RateLimit-Ip-Hourly-Limit/Remaining/Reset` and
+`X-PocketHost-RateLimit-Instance-Hourly-Limit/Remaining/Reset` triples
+govern subsequent requests, including login.
+Only nonnegative integers within each scope's limit, with a Unix reset from now
+through one hour ahead, are trusted. Missing or malformed headers never authorize
+an unbounded wait. Retained valid quota state is debited for every HTTP attempt,
+including failed requests and retries; a new valid response can tighten it.
+
+When either validated remaining quota is **10 or less**, the next request waits
+until all depleted scopes reset, plus a two-second margin. Waits use monotonic
+targets computed when the headers arrive, in finite chunks of at most 60 seconds.
+GETs retry transient HTTP errors at most twice. A GET 429 with validated quota
+can wait for reset; other transient GET retries use Retry-After capped at 30 seconds
+or a short backoff. A mutation 429 stops immediately, with its original journal
+intent pending. There is no proven pre-dispatch signature allowing safe automatic
+mutation replay; timeouts, lost responses, and other unknown write outcomes also
+stop without another write. Explicit later resume retains the existing fixed IDs
+and immutable-record checks.
+
+`--max-runtime-seconds` defaults to **14400** for the whole invocation, including
+authentication and quota waits. Each PocketBase request timeout is the smaller
+of 30 seconds and the remaining budget. The collector checks the deadline before
+collection, merge, planning, and subsequent record slices. Collection already in
+progress is not preempted; after it returns, an expired deadline prevents the next
+phase. A reset wait that cannot fit the remaining deadline fails immediately.
+Confirmed counters and checkpoints survive exhaustion, and errors remain sanitized.
+`http_attempts` counts every dispatched PocketBase HTTP attempt, including the
+prime, login, reads, retries, and writes (not upstream source requests).
+`quota_waits`, `quota_wait_seconds`, `runtime_seconds`, `max_runtime_seconds`, and
+`runtime_exhausted` report the invocation's budget use. These counters do not
+estimate other clients' traffic. Large plans may span several hourly windows or
+invocations; new collection still waits until saved intent finishes.
 
 `--batch-size` accepts integers from **1 to 50**, default **1** (the existing serial
 path). Values above 1 opt into transactional `POST /api/batch`. Each contiguous
@@ -270,7 +301,8 @@ written while down. Daily small updates may keep using the API.
   Other validation errors fail the operation and cannot trigger creation.
 - Upstream descriptions are untrusted text: the frontend renders only through
   `textContent` or escaped markup, and URLs go through an http(s) check.
-- No health ping or uptime monitor: the instance is left to idle on its own.
+- No scheduled health ping or uptime monitor; a PocketHost writer invocation uses
+  one health GET to acquire quota before login.
 
 ## Additional sources
 
@@ -290,3 +322,6 @@ and CLI exits, bounded retries, journal locking, and ambiguous/interrupted write
 Transactional batch tests cover 50+1 slicing, record caps, atomic rollback,
 immutable insert races and replay/read-state preservation, malformed results and
 checkpoints, failed immutable reads, and narrowly indexed icon fallback.
+Fake-clock quota tests cover startup before login, multiple quota windows, scoped
+header validation, bounded waits, request accounting, deadline stops, mutation
+429s and timeouts, and preserved journal intent and confirmed progress.

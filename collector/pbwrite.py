@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 import sys
 import tempfile
@@ -24,6 +25,108 @@ KEYS = {
 }
 COUNTERS = ('projects_created', 'projects_updated', 'entries', 'snapshots', 'events')
 _UNSPECIFIED = object()
+QUOTA_LIMITS = {'ip': 1000, 'instance': 10000}
+QUOTA_RESERVE = 10
+QUOTA_MARGIN = 2
+QUOTA_HORIZON = 3600
+
+
+class RuntimeDeadlineExceeded(RuntimeError):
+  """The invocation cannot safely start another request or quota wait."""
+
+
+class RuntimeBudget:
+  def __init__(self, max_runtime_seconds=14400):
+    if not math.isfinite(max_runtime_seconds) or max_runtime_seconds <= 0:
+      raise ValueError('max runtime must be finite and positive')
+    self.started = time.monotonic()
+    self.deadline = self.started + max_runtime_seconds
+    self.max_runtime_seconds = max_runtime_seconds
+    self.http_attempts = 0
+    self.quota_waits = 0
+    self.quota_wait_seconds = 0
+    self.exhausted = False
+    self.quotas = {}
+
+  def check(self):
+    if self.exhausted or time.monotonic() >= self.deadline:
+      self.exhausted = True
+      raise RuntimeDeadlineExceeded('invocation runtime budget exhausted')
+
+  def wait_until(self, target, quota=False):
+    self.check()
+    now = time.monotonic()
+    if target >= self.deadline:
+      self.exhausted = True
+      raise RuntimeDeadlineExceeded('quota or retry wait exceeds invocation deadline')
+    if target <= now:
+      return
+    if quota:
+      self.quota_waits += 1
+    # Finite foreground wait, with checks between chunks; never poll the server.
+    for _ in range(math.ceil((target - now) / 60) + 1):
+      self.check()
+      delay = min(60, target - time.monotonic())
+      if delay <= 0:
+        return
+      before = time.monotonic()
+      time.sleep(delay)
+      if quota:
+        self.quota_wait_seconds += max(0, time.monotonic() - before)
+    self.check()
+    if time.monotonic() < target:
+      raise RuntimeError('quota wait did not reach reset')
+
+  def observe(self, headers):
+    """Read the actual PocketHost hourly Limit/Remaining/Reset contract."""
+    headers = {k.lower(): str(v) for k, v in (headers or {}).items()}
+    wall, now = time.time(), time.monotonic()
+    resets = []
+    for scope in QUOTA_LIMITS:
+      prefix = f'x-pockethost-ratelimit-{scope}-hourly-'
+      values = [headers.get(prefix + field, '') for field in ('limit', 'remaining', 'reset')]
+      if not all(v and len(v) <= 12 and all('0' <= c <= '9' for c in v) for v in values):
+        continue
+      limit, remaining, reset = map(int, values)
+      delay = reset - wall
+      if not 0 < limit or not 0 <= remaining <= limit or not 0 <= delay <= QUOTA_HORIZON:
+        continue
+      target = now + delay + QUOTA_MARGIN
+      prior = self.quotas.get(scope)
+      self.quotas[scope] = ((min(prior[0], remaining), max(prior[1], target))
+                            if prior and prior[1] > now else (remaining, target))
+      resets.append(target)
+    return resets
+
+  def blocked_until(self):
+    now = time.monotonic()
+    self.quotas = {k: v for k, v in self.quotas.items() if v[1] > now}
+    return max((reset for remaining, reset in self.quotas.values()
+                if remaining <= QUOTA_RESERVE), default=now)
+
+  def before_request(self):
+    self.wait_until(self.blocked_until(), quota=True)
+    self.check()
+    timeout = min(30, self.deadline - time.monotonic())
+    if timeout <= 0:
+      self.check()
+    self.http_attempts += 1
+    self.quotas = {k: (max(0, remaining - 1), reset)
+                   for k, (remaining, reset) in self.quotas.items()}
+    return timeout
+
+  def report(self):
+    return {'http_attempts': self.http_attempts, 'quota_waits': self.quota_waits,
+            'quota_wait_seconds': self.quota_wait_seconds,
+            'runtime_seconds': max(0, time.monotonic() - self.started),
+            'runtime_exhausted': self.exhausted or time.monotonic() >= self.deadline,
+            'max_runtime_seconds': self.max_runtime_seconds}
+
+
+def _check_deadline(db):
+  budget = getattr(db, 'budget', None)
+  if budget is not None:
+    budget.check()
 
 
 class CheckpointDurabilityError(OSError):
@@ -102,15 +205,24 @@ def _source_scope(names):
 
 
 class PB:
-  def __init__(self, base, email, password, quiet=False):
+  def __init__(self, base, email, password, quiet=False, budget=None):
     self.base = base.rstrip('/')
     self.quiet = quiet
     self.token = None
     self.stash_path = None
     self.icon_fallbacks = 0
+    self.budget = budget if budget is not None else RuntimeBudget()
+    host = urllib.parse.urlsplit(self.base).hostname or ''
+    if host.endswith('.pockethost.io'):
+      try:
+        self._req('GET', '/api/health', auth=False, attempts=1)
+      except PBError as e:
+        # A single denied health prime may still supply a validated empty window.
+        if e.status != 429 or self.budget.blocked_until() <= time.monotonic():
+          raise
     self._login(email, password)
 
-  def _req(self, method, path, body=None, params=None, auth=True):
+  def _req(self, method, path, body=None, params=None, auth=True, attempts=3):
     url = self.base + path
     if params:
       url += '?' + urllib.parse.urlencode(params)
@@ -120,24 +232,35 @@ class PB:
     headers = dict(UA, **{'Content-Type': 'application/json'})
     if auth and self.token:
       headers['Authorization'] = self.token
-    for attempt in range(3):
+    if not hasattr(self, 'budget'):
+      self.budget = RuntimeBudget()
+    for attempt in range(attempts):
       req = urllib.request.Request(url, data=data, headers=headers, method=method)
+      timeout = self.budget.before_request()
       try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+          self.budget.observe(getattr(r, 'headers', None))
           raw = r.read()
           return json.loads(raw) if raw.strip() else None
       except urllib.error.HTTPError as e:
-        # Writes may commit despite a failed response; replay by fixed id.
-        if method == 'GET' and e.code in (429, 502, 503, 504) and attempt < 2:
-          delay = e.headers.get('Retry-After', '') if e.headers else ''
-          time.sleep(min(30, int(delay)) if delay.isdigit() else 2 ** attempt)
-          continue
         try:
-          detail = json.loads(e.read())
-        except (ValueError, OSError, http.client.HTTPException):
-          detail = {}
+          resets = self.budget.observe(e.headers)
+          # Mutation 429s have no proven pre-dispatch signature: never retry them.
+          if method == 'GET' and e.code in (429, 502, 503, 504) and attempt < attempts - 1:
+            delay = e.headers.get('Retry-After', '') if e.headers else ''
+            delay = min(30, int(delay)) if delay.isascii() and delay.isdigit() and len(delay) < 12 else 2 ** attempt
+            target = max(resets) if e.code == 429 and resets else time.monotonic() + delay
+            e.close()
+            self.budget.wait_until(target, quota=bool(e.code == 429 and resets))
+            continue
+          try:
+            detail = json.loads(e.read())
+          except (ValueError, OSError, http.client.HTTPException):
+            detail = {}
+        finally:
+          e.close()
         raise PBError(e.code, detail) from None
-      except http.client.HTTPException:
+      except (http.client.HTTPException, OSError):
         raise RuntimeError('PocketBase transport response unconfirmed') from None
 
   def _login(self, email, password):
@@ -469,6 +592,7 @@ def _drain(db, journal, path, max_writes, batch_size=1):
     op = journal['operations'][pos]
     stats['attempted'] += 1
     try:
+      _check_deadline(db)
       operations = journal['operations'][pos:min(pos + batch_size, stop)]
       if batch_size > 1:
         operations = _batch_slice(operations)
@@ -525,6 +649,8 @@ def _drain(db, journal, path, max_writes, batch_size=1):
     stats['pending_' + coll] = sum(op['collection'] == coll
                                   for op in journal['operations'][journal['next']:])
   stats['complete'] = stats['pending'] == 0 and stats['errors'] == 0
+  if getattr(db, 'budget', None) is not None:
+    stats.update(db.budget.report())
   return stats
 
 
@@ -563,7 +689,9 @@ def run(db, merged, today=None, dry_run=False, workers=1, max_writes=200, journa
       raise RuntimeError('collector input superseded by another journal generation')
     resumed = bool(journal and journal['next'] < len(journal['operations']))
     if not resumed:
+      _check_deadline(db)
       journal = _plan(db, merged, today, requested_sources)
+      _check_deadline(db)
       _save(path, journal)
     stats = _drain(db, journal, path, max_writes, batch_size)
     stats['resumed'] = resumed
