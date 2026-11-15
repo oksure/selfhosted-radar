@@ -136,6 +136,38 @@ def _checked_download(transport, name, path, expected):
     os.fsync(ff.fileno())
 
 
+def _capture_original(transport, directory):
+  """Retry read-only capture if SQLite removes sidecars during clean shutdown."""
+  for attempt in range(3):
+    capture = directory / f'capture-{attempt}'
+    capture.mkdir(mode=0o700)
+    hashes = {}
+    try:
+      present = set(transport.files()) & set(DBSET)
+      if 'data.db' not in present:
+        raise RuntimeError('stopped instance has no main DB')
+      for name in sorted(present):
+        transport.download(name, capture / name)
+        hashes[name] = digest(capture / name)
+        _checked_download(transport, name, directory / f'{name}.capture-{attempt}-check',
+                          hashes[name])
+      if set(transport.files()) & set(DBSET) != present:
+        raise RuntimeError('DB set changed while stopping')
+    except Interrupted:
+      raise
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
+      if attempt == 2:
+        raise
+      continue
+    # All failed attempts remain untouched. Publish only a stable original set.
+    original = directory / 'original'
+    shutil.copytree(capture, original)
+    for name in hashes:
+      with (original / name).open('rb') as ff:
+        os.fsync(ff.fileno())
+    return present, hashes
+
+
 def _receipt_path(path):
   return Path(str(path) + '.offline.json')
 
@@ -321,19 +353,7 @@ def run(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
     try:
       transport.stop()
       original = directory / 'original'
-      original.mkdir(mode=0o700)
-      present = set(transport.files()) & set(DBSET)
-      if 'data.db' not in present:
-        raise RuntimeError('stopped instance has no main DB')
-      for name in sorted(present):
-        transport.download(name, original / name)
-        with (original / name).open('rb') as ff:
-          os.fsync(ff.fileno())
-        receipt['original'][name] = digest(original / name)
-        _checked_download(transport, name, directory / (name + '.download-check'),
-                          receipt['original'][name])
-      if set(transport.files()) & set(DBSET) != present:
-        raise RuntimeError('DB set changed while stopped')
+      present, receipt['original'] = _capture_original(transport, directory)
       _record(path, receipt, 'backed_up')
       stage = directory / 'staged.db'
       _copy_db(original / 'data.db', stage)

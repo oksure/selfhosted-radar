@@ -105,6 +105,10 @@ Rollback persists a restart-pending boundary only after restoring the DB and
 journal. Recovery after that boundary retries startup without replacing files,
 preserving user changes made after a successful restart. A failed journal
 restoration leaves the instance stopped.
+During clean shutdown SQLite may remove WAL/SHM after the first directory
+listing. Read-only capture retries up to three times with fresh listings and
+hash checks, retaining every attempt. No upload, rename or checkpoint occurs
+until a stable complete original set has been captured.
 
 Local dry runs require a synthetic DB and a captured JSON object containing
 `date`, `requested_sources`, and `rows` (RawApp dictionaries). They never fetch,

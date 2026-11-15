@@ -239,6 +239,56 @@ def test_failed_intent_restore_keeps_instance_stopped(setup, monkeypatch):
   assert ('start',) not in remote.calls
 
 
+def test_shutdown_sidecar_disappears_capture_restarts_without_mutations(setup):
+  db, state, remote = setup
+  remote.data['data.db-shm'] = b'transient shared memory'
+  fired = []
+  def fail(kind, *args):
+    if kind == 'download' and args[0] == 'data.db-shm' and not fired:
+      fired.append(True)
+      remote.data.pop('data.db-shm')
+      raise O.subprocess.CalledProcessError(1, ['sftp'])
+  remote.failure = fail
+  result = run(setup)
+  assert result['success'] and fired and remote.on
+  rr = receipt(state)
+  assert set(rr['original']) == {'data.db'}
+  assert (Path(rr['directory']) / 'capture-0/data.db').exists()
+  assert (Path(rr['directory']) / 'capture-1/data.db').exists()
+  assert remote.calls.count(('stop',)) == 1
+
+
+def test_unstable_capture_stops_after_three_attempts_without_installing(setup):
+  db, state, remote = setup
+  original = remote.data['data.db']
+  def fail(kind, *args):
+    if kind == 'download':
+      raise O.subprocess.CalledProcessError(1, ['sftp'])
+  remote.failure = fail
+  with pytest.raises(O.subprocess.CalledProcessError):
+    run(setup)
+  assert len([c for c in remote.calls if c[0] == 'download']) == 3
+  assert not any(c[0] in ('upload', 'rename') for c in remote.calls)
+  assert remote.on and remote.data['data.db'] == original and saved(state) is None
+
+
+def test_sigterm_during_capture_does_not_retry_or_publish(setup, monkeypatch, capsys):
+  db, state, remote = setup
+  original = remote.data['data.db']
+  monkeypatch.setattr(O, 'SFTPTransport', lambda *args: remote)
+  from collector import sync
+  monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
+  def terminate(kind, *args):
+    if kind == 'download':
+      signal.raise_signal(signal.SIGTERM)
+  remote.failure = terminate
+  assert O.main(['--sftp-host', 'fixture.invalid', '--state-file', str(state)]) == 1
+  assert json.loads(capsys.readouterr().out)['error_type'] == 'Interrupted'
+  assert len([c for c in remote.calls if c[0] == 'download']) == 1
+  assert not any(c[0] in ('upload', 'rename') for c in remote.calls)
+  assert remote.on and remote.data['data.db'] == original and saved(state) is None
+
+
 @pytest.mark.parametrize('point', ['old-progress', 'fresh-publish', 'fresh-progress', 'after-progress-replace'])
 def test_checkpoint_failures_rollback_and_restore_pending_intent(setup, monkeypatch, point):
   db, state, remote = setup
