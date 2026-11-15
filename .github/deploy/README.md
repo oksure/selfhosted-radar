@@ -43,6 +43,8 @@ concurrency group serializes only this repository's workflows. GitHub concurrenc
 also permits replacement of a pending run by a newer pending run.
 
 Offline checks:
+Install the official CLI 4.3.0 on PATH before running these checks. Its real
+local-staging regression is mandatory and runs without network access.
 `netless python3 -m unittest discover -s .github/deploy -p 'test_*.py' -v`.
 These use synthetic CLI/HTTP responses and exercise no real instance.
 Actual token access, each target's response contract, and post-deployment live

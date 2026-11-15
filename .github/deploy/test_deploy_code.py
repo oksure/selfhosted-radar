@@ -291,7 +291,6 @@ class DeploymentTests(unittest.TestCase):
     expected = "selfhosted" if Path(__file__).parents[2].name == "selfhosted-radar" else "bible, console, gloria, sitefb, taskq"
     self.assertIn("instance: [" + expected + "]", text)
 
-  @unittest.skipUnless(shutil.which("pockethost"), "official CLI not installed")
   def test_official_cli_local_stage_ignores_ancestor_package_and_environment(self):
     # Real CLI local-only regression: cwd alone does not prevent ancestor lookup.
     (self.source.parent / "package.json").write_text('{"name":"wrong-ancestor"}')
