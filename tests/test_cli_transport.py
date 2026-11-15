@@ -79,8 +79,8 @@ def cli(monkeypatch, tmp_path):
   monkeypatch.setattr(socket, 'create_connection', blocked)
   monkeypatch.setattr(O.urllib.request, 'urlopen', blocked)
   monkeypatch.setattr(W.PB, '__init__', blocked)
-  monkeypatch.setenv('SELFHOSTED_POCKETHOST_TOKEN', 'synthetic-token')
-  monkeypatch.setenv('POCKETHOST_TOKEN', 'unrelated-parent-token')
+  monkeypatch.setenv('SELFHOSTED_POCKETHOST_TOKEN', 'obsolete-instance-token')
+  monkeypatch.setenv('POCKETHOST_TOKEN', 'synthetic-token')
   monkeypatch.setenv('POCKETHOST_MOTHERSHIP_URL', 'https://untrusted.example.invalid')
   monkeypatch.setenv('PHIO_MOTHERSHIP_URL', 'https://legacy.example.invalid')
   monkeypatch.setattr(O.shutil, 'which', lambda name: '/synthetic/pockethost')
@@ -117,7 +117,7 @@ def staging(suffix='upload', base='data.db'):
 
 def test_roundtrip_fresh_pulls_and_child_credential_environment(cli, tmp_path):
   runner, transport = cli
-  assert O.os.environ['POCKETHOST_TOKEN'] == 'unrelated-parent-token'
+  assert O.os.environ['POCKETHOST_TOKEN'] == 'synthetic-token'
   assert O.os.environ['POCKETHOST_MOTHERSHIP_URL'] == 'https://untrusted.example.invalid'
   assert transport.is_on()
   transport.stop()
@@ -143,9 +143,22 @@ def test_roundtrip_fresh_pulls_and_child_credential_environment(cli, tmp_path):
 def test_constructor_preflight(cli, monkeypatch, token, executable):
   runner, _ = cli
   if token is None:
-    monkeypatch.delenv('SELFHOSTED_POCKETHOST_TOKEN')
+    monkeypatch.delenv('POCKETHOST_TOKEN')
   monkeypatch.setattr(O.shutil, 'which', lambda name: executable)
   with pytest.raises(RuntimeError, match='required'):
+    O.CLITransport()
+  assert runner.calls == []
+
+
+@pytest.mark.parametrize('value', [None, ''])
+def test_obsolete_instance_token_never_substitutes_for_common_token(cli, monkeypatch, value):
+  runner, _ = cli
+  if value is None:
+    monkeypatch.delenv('POCKETHOST_TOKEN')
+  else:
+    monkeypatch.setenv('POCKETHOST_TOKEN', value)
+  assert O.os.environ['SELFHOSTED_POCKETHOST_TOKEN'] == 'obsolete-instance-token'
+  with pytest.raises(RuntimeError, match='POCKETHOST_TOKEN'):
     O.CLITransport()
   assert runner.calls == []
 
@@ -427,7 +440,7 @@ def test_main_dry_run_needs_neither_cli_nor_token(cli, tmp_path, monkeypatch, ca
   schema(db)
   collected.write_text(json.dumps({'date': TODAY, 'requested_sources': list(O.DAILY),
                                   'rows': [vars(row) for row in rows(O.DAILY)]}))
-  monkeypatch.delenv('SELFHOSTED_POCKETHOST_TOKEN')
+  monkeypatch.delenv('POCKETHOST_TOKEN')
   monkeypatch.setattr(O.shutil, 'which', lambda name: None)
   assert O.main(['--dry-run', '--db', str(db), '--from-collected', str(collected),
                  '--today', TODAY, '--state-file', str(tmp_path / 'writes.json')]) == 0

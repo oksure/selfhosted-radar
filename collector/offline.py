@@ -47,10 +47,10 @@ class CLITransport:
   identity = {'transport': 'pockethost-cli', 'instance': 'selfhosted', 'remote_dir': 'pb_data'}
 
   def __init__(self):
-    token = os.environ.get('SELFHOSTED_POCKETHOST_TOKEN')
+    token = os.environ.get('POCKETHOST_TOKEN')
     executable = shutil.which('pockethost')
     if not token or not executable:
-      raise RuntimeError('managed SELFHOSTED_POCKETHOST_TOKEN and pockethost CLI required')
+      raise RuntimeError('managed POCKETHOST_TOKEN and pockethost CLI required')
     self._env = dict(os.environ, POCKETHOST_TOKEN=token,
                      POCKETHOST_MOTHERSHIP_URL='https://mothership.pockethost.io')
     self._executable = executable

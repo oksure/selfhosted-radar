@@ -52,7 +52,7 @@ fresh requested input is planned through `SQLiteInventory` and applied through
 `apply_journal`. Neither SQL replay nor staging advances journal progress.
 
 ```bash
-# Managed SELFHOSTED_POCKETHOST_TOKEN; official CLI 4.3.0 on Node 24+ in PATH.
+# Managed POCKETHOST_TOKEN; official CLI 4.3.0 on Node 24+ in PATH.
 source ~/dotfiles/claude/hooks/agent-env.sh
 python3 -m collector.offline --sources awesome,selfhst,gh_trending
 bash collector/run_daily.sh
@@ -68,9 +68,11 @@ in the fresh scope. Only fresh scope plus installed DB plus successful restart
 and health check produces `success: true` and exit 0.
 
 Both runners source the existing `agent-env.sh`. The default transport requires
-the managed `SELFHOSTED_POCKETHOST_TOKEN` environment variable and resolves
-`pockethost` before stopping anything. It copies the environment and sets
-`POCKETHOST_TOKEN` only for the CLI child; credentials never enter arguments,
+the managed `POCKETHOST_TOKEN` environment variable and resolves
+`pockethost` before stopping anything. One shared platform token has read/write
+access to all instances, including future instances. Instance-specific platform
+tokens are not required. The Radar writer still targets `selfhosted` explicitly.
+It copies the environment for the CLI child. Credentials never enter arguments,
 receipts or output. The child's `POCKETHOST_MOTHERSHIP_URL` is pinned to
 `https://mothership.pockethost.io`, overriding inherited current or legacy URL
 settings. There is no SFTP fallback. The old `SFTPTransport` class is
