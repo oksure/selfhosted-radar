@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import urllib.request
 import uuid
@@ -29,6 +30,166 @@ DBSET = ('data.db', 'data.db-wal', 'data.db-shm')
 
 class Interrupted(RuntimeError):
   pass
+
+
+class MutationUncertain(RuntimeError):
+  """A server mutation may still be running; automatic recovery is unsafe."""
+
+
+class ReceiptTargetMismatch(RuntimeError):
+  pass
+
+
+class CLITransport:
+  """Official single-file CLI, scoped to the stopped Radar main DB set."""
+  identity = {'transport': 'pockethost-cli', 'instance': 'selfhosted', 'remote_dir': 'pb_data'}
+
+  def __init__(self):
+    token = os.environ.get('SELFHOSTED_POCKETHOST_TOKEN')
+    executable = shutil.which('pockethost')
+    if not token or not executable:
+      raise RuntimeError('managed SELFHOSTED_POCKETHOST_TOKEN and pockethost CLI required')
+    self._env = dict(os.environ, POCKETHOST_TOKEN=token,
+                     POCKETHOST_MOTHERSHIP_URL='https://mothership.pockethost.io')
+    self._executable = executable
+    self.uncertain = False
+    self._marker = None
+
+  def configure(self, path):
+    marker = Path(str(path) + '.cli-mutation.json')
+    if marker.exists():
+      record = json.loads(marker.read_text())
+      if (record.get('version') != 1 or record.get('transport') != self.identity
+          or type(record.get('pending')) is not bool):
+        raise RuntimeError('invalid CLI mutation marker')
+      if record['pending']:
+        self.uncertain = True
+    if self.uncertain:
+      raise MutationUncertain('unfinished CLI mutation requires operator reconciliation')
+    self._marker = marker
+
+  @staticmethod
+  def _remote(name):
+    if not isinstance(name, str) or not re.fullmatch(
+        r'data\.db(?:-wal|-shm)?(?:\.offline-[0-9a-f]{32}\.(?:original|rejected|upload|restore))?', name):
+      raise ValueError('only known main database filenames may be managed')
+    return 'pb_data/' + name
+
+  def _command(self, *args, mutation=False):
+    if self.uncertain:
+      raise MutationUncertain('CLI mutation outcome uncertain; operator reconciliation required')
+    record = {'version': 1, 'transport': self.identity, 'pending': True, 'command': args[0]}
+    if mutation:
+      if self._marker is None:
+        raise RuntimeError('CLI mutation requires a recorded journal context')
+      W._save(self._marker, record)
+      self.uncertain = True
+    try:
+      result = subprocess.run([self._executable, *args], env=self._env, text=True,
+                              capture_output=True, timeout=180, check=True)
+      if mutation:
+        W._save(self._marker, dict(record, pending=False))
+        self.uncertain = False
+      return result.stdout
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Interrupted, KeyboardInterrupt):
+      if mutation:
+        self.uncertain = True
+        raise MutationUncertain('CLI mutation outcome uncertain; operator reconciliation required') from None
+      raise
+
+  def is_on(self):
+    record = json.loads(self._command('show', 'selfhosted', '--json'))
+    if (not isinstance(record, dict) or record.get('subdomain') != 'selfhosted'
+        or record.get('id') != '2sb1xkspblek1f5' or type(record.get('power')) is not bool):
+      raise RuntimeError('instance power state was not confirmed')
+    return record['power']
+
+  def _stopped(self):
+    if self.is_on():
+      raise RuntimeError('main DB access requires a stopped instance')
+
+  def files(self, names=DBSET):
+    names = tuple(names)
+    paths = [(name, self._remote(name)) for name in names]
+    self._stopped()
+    present = set()
+    for name, path in paths:
+      try:
+        output = self._command('files', path, '--json', '-I', 'selfhosted')
+      except subprocess.CalledProcessError as exc:
+        if exc.returncode == 1 and exc.stderr == f'Error: {path} not found\n' and not exc.stdout:
+          continue
+        raise RuntimeError('exact CLI file probe failed') from None
+      records = json.loads(output)
+      if not isinstance(records, list) or len(records) != 1:
+        raise RuntimeError('invalid exact CLI file response')
+      record = records[0]
+      if (not isinstance(record, dict) or record.get('path') != path
+          or record.get('isDirectory') is not False
+          or type(record.get('size')) is not int or record['size'] < 0
+          or type(record.get('mtime')) not in (str, int, float) or record['mtime'] == ''):
+        raise RuntimeError('invalid exact CLI file response')
+      present.add(name)
+    return present
+
+  def download(self, name, path):
+    remote = self._remote(name)
+    if name not in self.files((name,)):
+      raise RuntimeError('exact CLI download source is missing')
+    # A fresh private destination defeats the CLI's mtime/size skip optimization.
+    with tempfile.TemporaryDirectory(prefix='radar-pull-') as directory:
+      self._command('pull', remote, '--data', '-d', directory, '-I', 'selfhosted')
+      source = Path(directory) / remote
+      if source.is_symlink() or not source.is_file() or source.parent.is_symlink():
+        raise RuntimeError('CLI pull did not produce the exact regular file')
+      shutil.copyfile(source, path)
+      with Path(path).open('rb') as ff:
+        os.fsync(ff.fileno())
+
+  def upload(self, path, name):
+    remote = self._remote(name)
+    if not name.endswith(('.upload', '.restore')) or not Path(path).is_file():
+      raise ValueError('uploads require a single file and a unique staging name')
+    if name in self.files((name,)):
+      raise RuntimeError('upload staging destination already exists')
+    self._command('upload', str(path), remote, '-I', 'selfhosted', mutation=True)
+
+  def rename(self, old, new):
+    source, destination = self._remote(old), self._remote(new)
+    canonical = old if old in DBSET else new
+    if canonical not in DBSET or not (
+        (old == canonical and new.startswith(canonical + '.offline-')
+         and new.endswith(('.original', '.rejected'))) or
+        (new == canonical and old.startswith(canonical + '.offline-')
+         and old.endswith(('.upload', '.restore')))):
+      raise ValueError('retained files cannot be move sources')
+    if new in self.files((new,)):
+      raise RuntimeError('move destination already exists')
+    with tempfile.TemporaryDirectory(prefix='radar-move-') as directory:
+      local = Path(directory) / 'source'
+      self.download(old, local)
+      expected = digest(local)
+      # The official server atomically publishes a completed single-file PUT.
+      self._stopped()
+      self._command('upload', str(local), destination, '-I', 'selfhosted', mutation=True)
+      _checked_download(self, new, Path(directory) / 'destination-check', expected)
+      _checked_download(self, old, Path(directory) / 'source-check', expected)
+      self._stopped()
+      self._command('rm', source, '-I', 'selfhosted', mutation=True)
+      if old in self.files((old,)):
+        raise RuntimeError('move source removal was not confirmed')
+
+  def stop(self):
+    self._command('power', 'off', 'selfhosted', '--wait', mutation=True)
+    self._stopped()
+
+  def start(self):
+    self._command('power', 'on', 'selfhosted', mutation=True)
+
+  def health(self):
+    request = urllib.request.Request(BASE + '/api/health', headers=W.UA)
+    with urllib.request.urlopen(request, timeout=20) as response:
+      return response.status == 200 and json.load(response).get('code') == 200
 
 
 class SFTPTransport:
@@ -64,10 +225,10 @@ class SFTPTransport:
                             text=True, capture_output=True, timeout=60, check=True)
     return result.stdout
 
-  def files(self):
+  def files(self, names=DBSET):
     output = self._batch('ls -1 ' + self._quote(self.remote_dir + '/'))
     return {PurePosixPath(line.strip()).name for line in output.splitlines()
-            if not line.startswith('sftp>') and line.strip()}
+            if not line.startswith('sftp>') and line.strip()} & set(names)
 
   def download(self, name, path):
     self._batch('get ' + self._quote(self._remote(name)) + ' ' + self._quote(path))
@@ -143,7 +304,7 @@ def _capture_original(transport, directory):
     capture.mkdir(mode=0o700)
     hashes = {}
     try:
-      present = set(transport.files()) & set(DBSET)
+      present = set(transport.files(DBSET))
       if 'data.db' not in present:
         raise RuntimeError('stopped instance has no main DB')
       for name in sorted(present):
@@ -151,7 +312,7 @@ def _capture_original(transport, directory):
         hashes[name] = digest(capture / name)
         _checked_download(transport, name, directory / f'{name}.capture-{attempt}-check',
                           hashes[name])
-      if set(transport.files()) & set(DBSET) != present:
+      if set(transport.files(DBSET)) != present:
         raise RuntimeError('DB set changed while stopping')
     except Interrupted:
       raise
@@ -173,6 +334,8 @@ def _receipt_path(path):
 
 
 def _record(path, receipt, phase):
+  if phase == 'uncertain' and receipt.get('phase') != 'uncertain':
+    receipt['uncertain_from'] = receipt['phase']
   updated = dict(receipt, phase=phase)
   W._save(Path(receipt['directory']) / 'receipt.json', updated)
   W._save(_receipt_path(path), updated)
@@ -245,7 +408,7 @@ def _rollback(transport, receipt):
   directory = Path(receipt['directory'])
   for name, expected in receipt['original'].items():
     backup = name + '.offline-' + receipt['id'] + '.original'
-    files = transport.files()
+    files = transport.files((*DBSET, backup))
     if backup in files:
       _checked_download(transport, backup, directory / (name + '.rollback-check'), expected)
       if name in files:
@@ -258,7 +421,7 @@ def _rollback(transport, receipt):
     else:
       _checked_download(transport, name, directory / (name + '.rollback-check'), expected)
   for name in set(DBSET) - set(receipt['original']):
-    if name in transport.files():
+    if name in transport.files((name,)):
       transport.rename(name, name + '.offline-' + uuid.uuid4().hex + '.rejected')
   for name, expected in receipt['original'].items():
     _checked_download(transport, name, directory / (name + '.restored-check'), expected)
@@ -271,6 +434,17 @@ def _restart(transport):
 
 
 def _abort(transport, path, receipt):
+  if getattr(transport, 'uncertain', False):
+    _record(path, receipt, 'uncertain')
+    raise MutationUncertain('CLI mutation outcome uncertain; operator reconciliation required')
+  try:
+    _abort_known(transport, path, receipt)
+  except MutationUncertain:
+    _record(path, receipt, 'uncertain')
+    raise
+
+
+def _abort_known(transport, path, receipt):
   if receipt['phase'] in ('installing', 'installed', 'rolling_back', 'rolled_back'):
     _record(path, receipt, 'rolling_back')
     _rollback(transport, receipt)
@@ -284,11 +458,23 @@ def _abort(transport, path, receipt):
 
 
 def _recover(transport, path, receipt, base):
+  try:
+    if hasattr(transport, 'configure'):
+      transport.configure(path)
+    _recover_known(transport, path, receipt, base)
+  except MutationUncertain:
+    _record(path, receipt, 'uncertain')
+    raise
+
+
+def _recover_known(transport, path, receipt, base):
   phase = receipt['phase']
   if phase in ('complete', 'aborted'):
     return
   if receipt['target'] != base or receipt['transport'] != transport.identity:
-    raise RuntimeError('offline receipt target mismatch')
+    raise ReceiptTargetMismatch('offline receipt target mismatch')
+  if phase == 'uncertain':
+    raise MutationUncertain('CLI mutation outcome uncertain; operator reconciliation required')
   if receipt.get('original_power') is not True:
     raise RuntimeError('receipt does not own an originally powered-on instance')
   if phase in ('checkpointed', 'restart_pending'):
@@ -330,6 +516,8 @@ def run(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
   if not names or set(names) - set(sources.ADAPTERS) or max_writes <= 0:
     raise ValueError('invalid offline scope or cap')
   with W._lock(path):
+    if hasattr(transport, 'configure'):
+      transport.configure(path)
     rp = _receipt_path(path)
     if rp.exists():
       _recover(transport, path, json.loads(rp.read_text()), base)
@@ -379,6 +567,9 @@ def run(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
     # startup failure; the next invocation retries health before fresh collection.
     try:
       _restart(transport)
+    except MutationUncertain:
+      _record(path, receipt, 'uncertain')
+      raise
     except Interrupted:
       _restart(transport)
       raise
@@ -411,10 +602,6 @@ def main(argv=None):
   ap.add_argument('--today', default=date.today().isoformat())
   ap.add_argument('--max-writes', type=int, default=100000)
   ap.add_argument('--backup-dir', default='')
-  host = os.environ.get('SELFHOSTED_SFTP_HOST') or (
-    os.environ['PH_EMAIL'] + '@ftp.pockethost.io' if os.environ.get('PH_EMAIL') else '')
-  ap.add_argument('--sftp-host', default=host)
-  ap.add_argument('--remote-dir', default='selfhosted/pb_data')
   ap.add_argument('--from-collected', default='')
   ap.add_argument('--dry-run', action='store_true')
   ap.add_argument('--db', default='', help='local data.db fixture for dry run')
@@ -428,8 +615,6 @@ def main(argv=None):
     ap.error('--today must be an ISO date')
   if args.dry_run and not (args.db and args.from_collected):
     ap.error('--dry-run requires --db and --from-collected; it never fetches')
-  if not args.dry_run and not args.sftp_host:
-    ap.error('PH_EMAIL, --sftp-host or SELFHOSTED_SFTP_HOST is required')
 
   def collect_rows(scope):
     if args.from_collected:
@@ -447,12 +632,11 @@ def main(argv=None):
   previous = signal.signal(signal.SIGTERM, terminated)
   try:
     if args.dry_run:
-      import tempfile
       with tempfile.TemporaryDirectory(prefix='radar-offline-') as directory:
         result = dry_run(args.db, args.state_file, collect_rows(names), names, args.today,
                          directory, args.max_writes)
     else:
-      result = run(SFTPTransport(args.sftp_host, args.remote_dir), args.state_file, collect_rows,
+      result = run(CLITransport(), args.state_file, collect_rows,
                    names, args.today, max_writes=args.max_writes, backup_dir=args.backup_dir)
     print(json.dumps(result))
     return 0

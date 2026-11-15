@@ -84,10 +84,10 @@ class Files:
     self.call('health')
     return self.on
 
-  def files(self):
+  def files(self, names=O.DBSET):
     assert not self.on
     self.call('files')
-    return set(self.data)
+    return set(self.data) & set(names)
 
   def download(self, name, path):
     assert not self.on and name.startswith('data.db')
@@ -275,14 +275,14 @@ def test_unstable_capture_stops_after_three_attempts_without_installing(setup):
 def test_sigterm_during_capture_does_not_retry_or_publish(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'SFTPTransport', lambda *args: remote)
+  monkeypatch.setattr(O, 'CLITransport', lambda: remote)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   def terminate(kind, *args):
     if kind == 'download':
       signal.raise_signal(signal.SIGTERM)
   remote.failure = terminate
-  assert O.main(['--sftp-host', 'fixture.invalid', '--state-file', str(state)]) == 1
+  assert O.main(['--state-file', str(state)]) == 1
   assert json.loads(capsys.readouterr().out)['error_type'] == 'Interrupted'
   assert len([c for c in remote.calls if c[0] == 'download']) == 1
   assert not any(c[0] in ('upload', 'rename') for c in remote.calls)
@@ -414,7 +414,7 @@ def test_journal_lock_excludes_capture_and_downtime(setup):
 def test_sigterm_during_install_rolls_back_restarts_and_exits_failure(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'SFTPTransport', lambda *args: remote)
+  monkeypatch.setattr(O, 'CLITransport', lambda: remote)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   sent = []
@@ -423,7 +423,7 @@ def test_sigterm_during_install_rolls_back_restarts_and_exits_failure(setup, mon
       sent.append(True)
       signal.raise_signal(signal.SIGTERM)
   remote.failure = terminate
-  status = O.main(['--sftp-host', 'fixture.invalid', '--state-file', str(state)])
+  status = O.main(['--state-file', str(state)])
   assert status == 1 and json.loads(capsys.readouterr().out)['success'] is False
   assert remote.on and remote.data['data.db'] == original
   assert receipt(state)['phase'] == 'aborted'
@@ -442,7 +442,7 @@ def test_runners_preserve_daily_weekly_scope():
 def test_sigterm_at_startup_retries_start_without_rolling_back(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'SFTPTransport', lambda *args: remote)
+  monkeypatch.setattr(O, 'CLITransport', lambda: remote)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   sent = []
@@ -451,7 +451,7 @@ def test_sigterm_at_startup_retries_start_without_rolling_back(setup, monkeypatc
       sent.append(True)
       signal.raise_signal(signal.SIGTERM)
   remote.failure = terminate
-  assert O.main(['--sftp-host', 'fixture.invalid', '--state-file', str(state)]) == 1
+  assert O.main(['--state-file', str(state)]) == 1
   assert json.loads(capsys.readouterr().out)['error_type'] == 'Interrupted'
   assert remote.on and remote.data['data.db'] != original
   assert receipt(state)['phase'] == 'checkpointed'
@@ -492,19 +492,19 @@ def test_health_uses_existing_pockethost_user_agent(monkeypatch):
   assert O.SFTPTransport('fixture@example.invalid').health()
 
 
-def test_default_destination_uses_existing_ph_email(setup, monkeypatch, capsys):
+def test_default_destination_uses_cli_without_sftp_fallback(setup, monkeypatch, capsys):
   db, state, remote = setup
   destinations = []
-  def transport(host, directory):
-    destinations.append(host)
+  def transport():
+    destinations.append('official-cli')
     return remote
   monkeypatch.delenv('SELFHOSTED_SFTP_HOST', raising=False)
   monkeypatch.setenv('PH_EMAIL', 'fixture@example.invalid')
-  monkeypatch.setattr(O, 'SFTPTransport', transport)
+  monkeypatch.setattr(O, 'CLITransport', transport)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   assert O.main(['--state-file', str(state)]) == 0
-  assert destinations == ['fixture@example.invalid@ftp.pockethost.io']
+  assert destinations == ['official-cli']
   assert json.loads(capsys.readouterr().out)['success']
 
 

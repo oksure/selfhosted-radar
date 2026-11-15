@@ -45,14 +45,14 @@ tests/         merge, delta and adapter tests
 
 Daily and weekly bulk runs use `collector.offline`. Sources are captured while
 the site is online. Under the API writer's existing journal lock, it stops only
-`selfhosted` with `phost`, freshly downloads the stopped `data.db` and any WAL/SHM,
+`selfhosted` with the official `pockethost` CLI, freshly downloads the stopped `data.db` and any WAL/SHM,
 and preserves them locally. SQLite's backup API builds a separate staging DB,
 including WAL content. Pending intent is replayed with its exact saved IDs, then
 fresh requested input is planned through `SQLiteInventory` and applied through
 `apply_journal`. Neither SQL replay nor staging advances journal progress.
 
 ```bash
-# Existing PH_EMAIL and managed credentials; no key migration.
+# Managed SELFHOSTED_POCKETHOST_TOKEN; official CLI 4.3.0 on Node 24+ in PATH.
 source ~/dotfiles/claude/hooks/agent-env.sh
 python3 -m collector.offline --sources awesome,selfhst,gh_trending
 bash collector/run_daily.sh
@@ -67,19 +67,34 @@ partial fresh scope. Requested adapters that return no entries remain recorded
 in the fresh scope. Only fresh scope plus installed DB plus successful restart
 and health check produces `success: true` and exit 0.
 
-Both runners source the existing `agent-env.sh`. SFTP defaults to
-`${PH_EMAIL}@ftp.pockethost.io`, port 2222, using the existing
-`~/.ssh/pockethost_ed25519` key with OpenSSH batch authentication. `--sftp-host`
-or `SELFHOSTED_SFTP_HOST` may override the destination. A fresh run confirms ON
+Both runners source the existing `agent-env.sh`. The default transport requires
+the managed `SELFHOSTED_POCKETHOST_TOKEN` environment variable and resolves
+`pockethost` before stopping anything. It copies the environment and sets
+`POCKETHOST_TOKEN` only for the CLI child; credentials never enter arguments,
+receipts or output. The child's `POCKETHOST_MOTHERSHIP_URL` is pinned to
+`https://mothership.pockethost.io`, overriding inherited current or legacy URL
+settings. There is no SFTP fallback. The old `SFTPTransport` class is
+available only to explicit legacy Python callers. A fresh run confirms ON
 power before and after collection and refuses to turn on an intentionally OFF
 instance. Recovery may restore only its recorded original ON state. The source
-and tests never read key contents.
+and tests never read key contents. Incomplete receipts from the legacy transport
+fail with a target mismatch; completed receipts remain accepted.
 
 The staged DB passes SQLite integrity checks, uses DELETE journal mode, and is
 uploaded to a unique temporary name. A downloaded copy must match its SHA-256
 before installation. The original main DB set is renamed to retained remote
-backups; old WAL/SHM cannot attach to the new DB. An atomic same-directory rename
-installs the candidate, followed by another download/hash check. Only then are
+backups; old WAL/SHM cannot attach to the new DB. Because the CLI has no rename,
+each logical move requires a stopped instance and an absent destination, pulls
+the source into a fresh private directory, hashes and fsyncs it, uploads that
+single file, then freshly pulls and verifies both destination and unchanged
+source before removing only the source. An exact missing-file probe confirms
+removal. The official server writes a `.ph-upload` temporary file and atomically
+publishes the completed PUT, so a partially uploaded DB is never published.
+Retained `.original` and `.rejected` copies cannot be move sources or deleted.
+Only canonical DB files and unique `.upload`/`.restore` staging files can be
+removed by a verified move. All listings probe exact canonical or receipt-derived
+names; directory uploads, recursive operations and deployment are never used.
+Another download/hash check verifies installation. Only then are
 the old generation checkpointed, fresh intent published and fresh progress
 checkpointed, using the API writer's durable primitives. `auxiliary.db` and all
 other files are untouched. This path never constructs a record API client or
@@ -92,10 +107,17 @@ directory (or `--backup-dir`). Receipt and capture JSON files use mode 0600 and
 run directories use 0700. No backup is deleted. Keep these artifacts private and
 retain them until the operator explicitly chooses a retention policy.
 
-Transfer, rename, hash or checkpoint failures trigger restoration of the original
-DB set and journal cursor, then restart/health verification. SIGTERM enters the
-same cleanup path. An uncatchable kill is reconciled from the saved receipt on
-the next invocation: verify the installed hash before publishing progress, or
+Read, hash or checkpoint failures trigger restoration of the original DB set and
+journal cursor, then restart/health verification. Failed mutating CLI commands
+record `uncertain` and stop automatic work: the server may still be writing, so
+no conflicting rollback or restart is attempted. A tiny credential-free
+`writes.json.cli-mutation.json` marker is fsynced before every mutation and cleared
+only after successful acknowledgment. A process killed during a command therefore
+also requires operator reconciliation, including in a fresh process. Lost
+responses leave the retained original copies available for that reconciliation.
+Other SIGTERM interruptions enter the cleanup path. An uncatchable kill outside
+a pending mutation is reconciled from the saved receipt on the next invocation:
+verify the installed hash before publishing progress, or
 restore a partial installation. After a checkpointed installation, startup
 failure retains that installation and its progress; the next invocation retries
 startup/health before collecting fresh input. A changed installed hash or failed
@@ -112,7 +134,7 @@ until a stable complete original set has been captured.
 
 Local dry runs require a synthetic DB and a captured JSON object containing
 `date`, `requested_sources`, and `rows` (RawApp dictionaries). They never fetch,
-instantiate SFTP, stop the instance, install a DB or publish journal progress.
+require a CLI or token, stop the instance, install a DB or publish journal progress.
 Successful validation exits 0 with `dry_run: true` and `success: false`.
 
 ```bash
@@ -120,10 +142,9 @@ netless python3 -m collector.offline --dry-run --db /path/to/fixture/data.db \
   --from-collected /path/to/captured.json --state-file /path/to/test-writes.json
 ```
 
-The orchestration transport exposes file listing/download/upload/rename plus
-stop/start/health, keeping a future CLI transport independent of this recovery.
-It uses existing SFTP authentication. API-key/CLI migration, timer enablement and
-live installation are separate operator actions. The daily service should allow
+The orchestration transport exposes bounded file probes/download/upload/logical
+moves plus stop/start/health. API-key provisioning, runtime PATH/environment,
+timer enablement and live installation are separate operator actions. The daily service should allow
 1800 seconds to start and 300 seconds for termination cleanup; source collection
 happens before the downtime window. Serialize any other host or writer using a
 different journal path.
@@ -366,7 +387,11 @@ netless python3 -m pytest tests -q
 ```
 
 Offline orchestration tests use migration-derived SQLite fixtures and an in-memory
-file transport. They deny sockets, subprocesses and record API construction, and
+file transport. CLI transport tests substitute a synthetic command runner and
+deny sockets and record API construction. They cover exact absence versus auth
+failures, fresh private pulls, credential isolation, malformed paths/listings,
+verified moves, lost responses and mutation timeouts. Orchestration tests deny
+sockets, subprocesses and record API construction, and
 cover online capture, old/fresh replay, scopes, WAL inclusion/removal, operation
 caps, transfer/hash/rename failures, checkpoint rollback, crash receipts, startup
 recovery, SIGTERM cleanup and local-only dry runs.
