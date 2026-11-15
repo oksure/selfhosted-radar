@@ -1,6 +1,7 @@
-"""Serial PocketBase writes backed by a durable, replayable local journal."""
+"""Bounded PocketBase writes backed by a durable, replayable local journal."""
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import sys
@@ -22,6 +23,43 @@ KEYS = {
   'surveillance_events': ('project', 'event_type', 'occurred_at'),
 }
 COUNTERS = ('projects_created', 'projects_updated', 'entries', 'snapshots', 'events')
+_UNSPECIFIED = object()
+
+
+class CheckpointDurabilityError(OSError):
+  """Replacement is visible, but directory durability was not confirmed."""
+IMMUTABLE = ('repo_snapshots', 'surveillance_events')
+BATCH_MAX_BYTES = 4 * 1024 * 1024
+
+
+class BatchSizeError(ValueError):
+  """A single intact record cannot fit the conservative batch byte limit."""
+
+
+def _encode_body(body):
+  return json.dumps(body).encode()
+
+
+def _batch_request(op):
+  coll = op['collection']
+  return {'method': 'POST' if coll in IMMUTABLE else 'PUT',
+          'url': f'/api/collections/{coll}/records', 'body': dict(op['body'])}
+
+
+def _batch_slice(operations):
+  # Match json.dumps' actual default ASCII escaping and comma-space separators,
+  # including the requests envelope, without re-encoding each growing prefix.
+  size = len(_encode_body({'requests': []}))
+  selected = []
+  for op in operations:
+    extra = len(_encode_body(_batch_request(op))) + (2 if selected else 0)
+    if size + extra > BATCH_MAX_BYTES:
+      if not selected:
+        raise BatchSizeError('single record exceeds 4 MiB encoded batch limit')
+      break
+    size += extra
+    selected.append(op)
+  return selected
 
 
 class PBError(RuntimeError):
@@ -41,6 +79,28 @@ def _rid(coll, row):
   return hashlib.sha256(raw).hexdigest()[:15]
 
 
+def _confirmed(coll, body, row):
+  if (not isinstance(row, dict) or row.get('id') != body['id']
+      or _key(coll, row) != _key(coll, body)):
+    raise ValueError('write response did not confirm record identity')
+  return row
+
+
+def _icon_only(fields):
+  return (isinstance(fields, dict) and set(fields) == {'icon_url'}
+          and isinstance(fields['icon_url'], dict)
+          and fields['icon_url'].get('code') in ('validation_invalid_url', 'validation_is_url'))
+
+
+def _source_scope(names):
+  if names is None:
+    return None
+  if (not isinstance(names, (list, tuple)) or not names
+      or any(not isinstance(n, str) or not n for n in names)):
+    raise ValueError('invalid requested source scope')
+  return sorted(set(names))
+
+
 class PB:
   def __init__(self, base, email, password, quiet=False):
     self.base = base.rstrip('/')
@@ -54,7 +114,9 @@ class PB:
     url = self.base + path
     if params:
       url += '?' + urllib.parse.urlencode(params)
-    data = json.dumps(body).encode() if body is not None else None
+    data = _encode_body(body) if body is not None else None
+    if path == '/api/batch' and data is not None and len(data) > BATCH_MAX_BYTES:
+      raise BatchSizeError('batch exceeds 4 MiB encoded body limit')
     headers = dict(UA, **{'Content-Type': 'application/json'})
     if auth and self.token:
       headers['Authorization'] = self.token
@@ -72,9 +134,11 @@ class PB:
           continue
         try:
           detail = json.loads(e.read())
-        except (ValueError, OSError):
+        except (ValueError, OSError, http.client.HTTPException):
           detail = {}
         raise PBError(e.code, detail) from None
+      except http.client.HTTPException:
+        raise RuntimeError('PocketBase transport response unconfirmed') from None
 
   def _login(self, email, password):
     r = self._req('POST', '/api/collections/_superusers/auth-with-password',
@@ -87,6 +151,8 @@ class PB:
       r = self._req('GET', f'/api/collections/{coll}/records',
                     params={'page': page, 'perPage': per, 'filter': flt,
                             'fields': fields, 'skipTotal': 1, 'sort': 'id'})
+      if not isinstance(r, dict) or not isinstance(r.get('items'), list):
+        raise ValueError('collection lookup did not confirm record inventory')
       items = r['items']
       out.extend(items)
       if len(items) < per:
@@ -109,10 +175,7 @@ class PB:
       return self._req(method, path, body)
     except PBError as e:
       fields = e.data.get('data', {})
-      icon = fields.get('icon_url', {}) if isinstance(fields, dict) else {}
-      if not (coll == 'projects' and e.status == 400 and isinstance(fields, dict)
-              and set(fields) == {'icon_url'} and isinstance(icon, dict)
-              and icon.get('code') in ('validation_invalid_url', 'validation_is_url')
+      if not (coll == 'projects' and e.status == 400 and _icon_only(fields)
               and body.get('icon_url')):
         raise
       # PATCH preserves the previous icon; POST uses the default. Original input
@@ -129,11 +192,9 @@ class PB:
     path = f'/api/collections/{coll}/records'
 
     def confirmed(row):
-      if not isinstance(row, dict) or row.get('id') != rid or _key(coll, row) != _key(coll, body):
-        raise ValueError('write response did not confirm record identity')
-      return row
+      return _confirmed(coll, payload, row)
 
-    if coll in ('repo_snapshots', 'surveillance_events'):
+    if coll in IMMUTABLE:
       try:
         old = self._req('GET', f'{path}/{rid}')
       except PBError as e:
@@ -148,6 +209,78 @@ class PB:
         if e.status != 404:
           raise
     return confirmed(self._write('POST', path, payload, coll))
+
+  def write_batch(self, operations):
+    """Confirm one contiguous slice; immutable rows are never upserted."""
+    existing = set()
+    for coll in IMMUTABLE:
+      wanted = {op['body']['id']: op['body'] for op in operations if op['collection'] == coll}
+      if not wanted:
+        continue
+      result = self._req('GET', f'/api/collections/{coll}/records', params={
+        'filter': ' || '.join('id=' + json.dumps(rid) for rid in wanted),
+        'page': 1, 'perPage': 50, 'skipTotal': 1,
+        'fields': ','.join(('id',) + KEYS[coll]),
+      })
+      if not isinstance(result, dict) or not isinstance(result.get('items'), list):
+        raise ValueError('immutable lookup did not confirm record absence')
+      found = set()
+      for row in result['items']:
+        rid = row.get('id') if isinstance(row, dict) else None
+        if not isinstance(rid, str) or rid not in wanted or rid in found:
+          raise ValueError('immutable lookup returned unexpected record identity')
+        _confirmed(coll, wanted[rid], row)
+        found.add(rid)
+      existing.update((coll, rid) for rid in found)
+    requests, submitted = [], []
+    for op in operations:
+      coll, body = op['collection'], op['body']
+      if (coll, body['id']) in existing:
+        continue  # Preserve detail/is_read, including after a lost response.
+      requests.append(_batch_request(op))
+      submitted.append(op)
+    if not requests:
+      return
+    omitted = set()
+    for attempt in range(len(requests) + 1):
+      try:
+        results = self._req('POST', '/api/batch', {'requests': requests})
+        break
+      except PBError as e:
+        # Only PocketBase's indexed transactional rollback envelope proves this
+        # retry safe. A timeout, malformed result, or ordinary 400 is ambiguous.
+        data = e.data.get('data')
+        errors = data.get('requests') if isinstance(data, dict) else None
+        if not (e.status == 400 and isinstance(data, dict) and set(data) == {'requests'}
+                and isinstance(errors, dict) and len(errors) == 1):
+          raise
+        index, error = next(iter(errors.items()))
+        if not (isinstance(index, str) and index.isascii() and index.isdigit()
+                and str(int(index)) == index and int(index) < len(requests)
+                and isinstance(error, dict) and error.get('code') == 'batch_request_failed'):
+          raise
+        i = int(index)
+        response = error.get('response')
+        statuses = ([response[k] for k in ('status', 'code') if k in response]
+                    if isinstance(response, dict) else [])
+        identity = (submitted[i]['collection'], submitted[i]['body']['id'])
+        if not (statuses and all(type(s) is int and s == 400 for s in statuses)
+                and _icon_only(response.get('data')) and identity not in omitted
+                and submitted[i]['collection'] == 'projects'
+                and requests[i]['body'].get('icon_url') and attempt < len(requests)):
+          raise
+        requests[i]['body'].pop('icon_url')  # Outgoing copy only; preserve intent.
+        omitted.add(identity)
+    if not isinstance(results, list) or len(results) != len(submitted):
+      raise ValueError('batch response did not confirm every record')
+    for op, result in zip(submitted, results):
+      if not (isinstance(result, dict) and type(result.get('status')) is int
+              and result['status'] == 200):
+        raise ValueError('batch response did not confirm record status')
+      _confirmed(op['collection'], op['body'], result.get('body'))
+    if omitted:
+      self.icon_fallbacks += len(omitted)
+      print('  projects: omitted rejected icon_url (input retained in journal)', file=sys.stderr)
 
 
 def state_path(db, path=None):
@@ -176,11 +309,14 @@ def _save(path, payload):
       ff.flush()
       os.fsync(ff.fileno())
     os.replace(tmp, path)
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
-      os.fsync(fd)
-    finally:
-      os.close(fd)
+      fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+      try:
+        os.fsync(fd)
+      finally:
+        os.close(fd)
+    except Exception:
+      raise CheckpointDurabilityError('checkpoint replacement durability unknown') from None
   finally:
     if os.path.exists(tmp):
       os.unlink(tmp)
@@ -201,6 +337,9 @@ def _load(path, db):
   date.fromisoformat(journal['date'])
   if not isinstance(journal.get('generation'), str) or not journal['generation']:
     raise ValueError('journal has no generation')
+  scope = journal.get('requested_sources')
+  if scope is not None and _source_scope(scope) != scope:
+    raise ValueError('invalid journal source scope')
   try:
     with Path(str(path) + '.progress').open(encoding='utf-8') as ff:
       progress = json.load(ff)
@@ -237,7 +376,7 @@ def daily_workload(merged):
           'baseline_operations': 2 * len(projects) + len(entries)}
 
 
-def _plan(db, merged, today):
+def _plan(db, merged, today, requested_sources=None):
   from .canonical import slug
   from .merge import activity_status, delta, is_star_surge
 
@@ -310,6 +449,7 @@ def _plan(db, merged, today):
       add('projects', p, 'projects_updated')
   return {'version': 1, 'generation': uuid.uuid4().hex,
           'target': db.base.rstrip('/'), 'date': today,
+          'requested_sources': _source_scope(requested_sources),
           'daily_workload': daily_workload(merged), 'operations': operations, 'next': 0}
 
 
@@ -318,40 +458,67 @@ def _event(pid, etype, src, title, detail, today):
           'detail': detail, 'occurred_at': today, 'is_read': False}
 
 
-def _drain(db, journal, path, max_writes):
+def _drain(db, journal, path, max_writes, batch_size=1):
   stats = dict.fromkeys(COUNTERS, 0)
   stats.update(errors=0, attempted=0, icon_fallbacks=0, date=journal['date'])
   before = getattr(db, 'icon_fallbacks', 0)
   start = journal['next']
-  for op in journal['operations'][start:start + max_writes]:
+  stop = min(len(journal['operations']), start + max_writes)
+  pos = start
+  while pos < stop:
+    op = journal['operations'][pos]
     stats['attempted'] += 1
     try:
-      db.upsert(op['collection'], op['body'], rid=op['body']['id'])
-    except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e:
+      operations = journal['operations'][pos:min(pos + batch_size, stop)]
+      if batch_size > 1:
+        operations = _batch_slice(operations)
+      stats['attempted'] += len(operations) - 1
+      if batch_size == 1:
+        db.upsert(op['collection'], op['body'], rid=op['body']['id'])
+      else:
+        db.write_batch(operations)
+    except Exception as e:
       stats['errors'] += 1
       stats['failure'] = {'collection': op['collection'], 'id': op['body']['id'],
                           'error_type': type(e).__name__,
                           'http_status': e.status if isinstance(e, PBError) else None}
+      if isinstance(e, BatchSizeError):
+        stats['failure'].update(reason='record_exceeds_batch_byte_limit',
+                                max_batch_bytes=BATCH_MAX_BYTES)
       print(f'  {op["collection"]}/{op["body"]["id"]}: {type(e).__name__}; '
             'write unconfirmed, retained for replay', file=sys.stderr)
       break
-    journal['next'] += 1
+    cursor = pos + len(operations)
     # Failed checkpoints leave the durable position behind; replay uses the
     # same id and never advances past unconfirmed work.
     try:
       _save(Path(str(path) + '.progress'),
-            {'generation': journal['generation'], 'next': journal['next']})
-    except OSError:
-      journal['next'] -= 1
+            {'generation': journal['generation'], 'next': cursor})
+    except Exception as e:
       stats['errors'] += 1
       stats['failure'] = {'collection': op['collection'], 'id': op['body']['id'],
                           'error_type': 'CheckpointError', 'http_status': None}
-      print('  journal checkpoint failed; write retained for replay', file=sys.stderr)
+      if isinstance(e, CheckpointDurabilityError):
+        journal['next'] = cursor
+        for confirmed in operations:
+          stats[confirmed['counter']] += 1
+        stats['checkpoint_durability'] = 'unknown'
+        stats['checkpointed_before_failure'] = pos
+        stats['failure']['error_type'] = 'CheckpointDurabilityError'
+        print('  checkpoint replacement is visible but durability is unknown; '
+              'reload the journal before deciding replay', file=sys.stderr)
+      else:
+        print('  journal checkpoint failed before replacement; write retained for replay', file=sys.stderr)
       break
-    stats[op['counter']] += 1
+    journal['next'] = cursor
+    pos = cursor
+    for op in operations:
+      stats[op['counter']] += 1
   stats['icon_fallbacks'] = getattr(db, 'icon_fallbacks', 0) - before
   stats['planned'] = len(journal['operations'])
+  stats['generation'] = journal['generation']
   stats['daily_workload'] = journal.get('daily_workload')
+  stats['requested_sources'] = journal.get('requested_sources')
   stats['confirmed_total'] = journal['next']
   stats['pending'] = stats['planned'] - stats['confirmed_total']
   for coll in KEYS:
@@ -361,39 +528,57 @@ def _drain(db, journal, path, max_writes):
   return stats
 
 
-def run(db, merged, today=None, dry_run=False, workers=1, max_writes=200, journal_path=None):
-  """Persist intent, then confirm at most max_writes serial record operations.
+def journal_state(db, journal_path=None):
+  """Read pending status and intent version in the same lock window."""
+  path = state_path(db, journal_path)
+  with _lock(path):
+    journal = _load(path, db)
+    return {'generation': journal['generation'] if journal else None,
+            'pending': bool(journal and journal['next'] < len(journal['operations']))}
+
+
+def generation(db, journal_path=None):
+  return journal_state(db, journal_path)['generation']
+
+
+def run(db, merged, today=None, dry_run=False, workers=1, max_writes=200, journal_path=None,
+        batch_size=1, requested_sources=None, expected_generation=_UNSPECIFIED):
+  """Persist intent, then confirm at most max_writes record operations.
 
   An unfinished journal takes precedence over newly collected data.
   workers is retained for callers, but parallel writes are rejected.
   """
-  if workers != 1 or max_writes < 1:
-    raise ValueError('workers must be 1 and max_writes must be positive')
+  if workers != 1 or max_writes < 1 or type(batch_size) is not int or not 1 <= batch_size <= 50:
+    raise ValueError('workers must be 1, max_writes positive, and batch_size an integer in 1..50')
   today = today or date.today().isoformat()
   date.fromisoformat(today)
+  requested_sources = _source_scope(requested_sources)
   if dry_run:
     return {'dry_run': True, 'projects': len(merged), 'complete': False}
   path = state_path(db, journal_path)
   with _lock(path):
     journal = _load(path, db)
+    actual_generation = journal['generation'] if journal else None
+    if expected_generation is not _UNSPECIFIED and actual_generation != expected_generation:
+      raise RuntimeError('collector input superseded by another journal generation')
     resumed = bool(journal and journal['next'] < len(journal['operations']))
     if not resumed:
-      journal = _plan(db, merged, today)
+      journal = _plan(db, merged, today, requested_sources)
       _save(path, journal)
-    stats = _drain(db, journal, path, max_writes)
+    stats = _drain(db, journal, path, max_writes, batch_size)
     stats['resumed'] = resumed
     return stats
 
 
-def flush(db, workers=1, max_writes=200, journal_path=None):
+def flush(db, workers=1, max_writes=200, journal_path=None, batch_size=1):
   """Resume saved intent without fetching upstream or regenerating events."""
-  if workers != 1 or max_writes < 1:
-    raise ValueError('workers must be 1 and max_writes must be positive')
+  if workers != 1 or max_writes < 1 or type(batch_size) is not int or not 1 <= batch_size <= 50:
+    raise ValueError('workers must be 1, max_writes positive, and batch_size an integer in 1..50')
   path = state_path(db, journal_path)
   with _lock(path):
     journal = _load(path, db)
     if journal is None:
       raise ValueError('no write journal to resume')
-    stats = _drain(db, journal, path, max_writes)
+    stats = _drain(db, journal, path, max_writes, batch_size)
     stats['resumed'] = True
     return stats
