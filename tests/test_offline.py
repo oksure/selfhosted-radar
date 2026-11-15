@@ -422,6 +422,7 @@ def test_transport_argv_existing_port_key_and_phost_scope(monkeypatch):
   transport.start()
   argv = calls[1][0]
   assert argv[:5] == ['sftp', '-P', '2222', '-i', str(Path.home() / '.ssh/pockethost_ed25519')]
+  assert '-oIdentityAgent=none' in argv
   assert argv[-1] == 'fixture@example.invalid@ftp.pockethost.io'
   assert calls[0][0] == ['phost', 'status', 'selfhosted']
   assert calls[2][0] == ['phost', 'off', 'selfhosted', '--yes']

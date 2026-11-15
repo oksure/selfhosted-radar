@@ -58,7 +58,8 @@ class SFTPTransport:
 
   def _batch(self, command):
     result = subprocess.run(['sftp', '-P', '2222', '-i', str(Path.home() / '.ssh/pockethost_ed25519'),
-                             '-oIdentitiesOnly=yes', '-oBatchMode=yes', '-oConnectTimeout=20',
+                             '-oIdentitiesOnly=yes', '-oIdentityAgent=none',
+                             '-oBatchMode=yes', '-oConnectTimeout=20',
                              '-b', '-', self.host], input=command + '\n',
                             text=True, capture_output=True, timeout=60, check=True)
     return result.stdout
