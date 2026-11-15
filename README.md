@@ -43,11 +43,90 @@ tests/         merge, delta and adapter tests
 
 ## Loading data
 
-Two loading paths exist: a durable API collector and a legacy offline SQLite
-loader. Record capacity and HTTP quotas are separate concerns; neither a large
-record cap nor batching alone proves that a run fits the available request budget.
+Daily and weekly bulk runs use `collector.offline`. Sources are captured while
+the site is online. Under the API writer's existing journal lock, it stops only
+`selfhosted` with `phost`, freshly downloads the stopped `data.db` and any WAL/SHM,
+and preserves them locally. SQLite's backup API builds a separate staging DB,
+including WAL content. Pending intent is replayed with its exact saved IDs, then
+fresh requested input is planned through `SQLiteInventory` and applied through
+`apply_journal`. Neither SQL replay nor staging advances journal progress.
 
-**API update (the daily path).** The writer saves the complete plan locally,
+```bash
+# Existing PH_EMAIL and managed credentials; no key migration.
+source ~/dotfiles/claude/hooks/agent-env.sh
+python3 -m collector.offline --sources awesome,selfhst,gh_trending
+bash collector/run_daily.sh
+bash collector/run_weekly_sqlstage.sh  # adds gh_popular
+```
+
+Both runners share `${XDG_STATE_HOME:-~/.local/state}/selfhosted-radar/writes.json`
+by default, also configurable with `--state-file`. `--max-writes` defaults to
+100,000 offline operations across pending and fresh plans; it is independent of
+the API's 200-operation default. Insufficient capacity fails without installing
+partial fresh scope. Requested adapters that return no entries remain recorded
+in the fresh scope. Only fresh scope plus installed DB plus successful restart
+and health check produces `success: true` and exit 0.
+
+Both runners source the existing `agent-env.sh`. SFTP defaults to
+`${PH_EMAIL}@ftp.pockethost.io`, port 2222, using the existing
+`~/.ssh/pockethost_ed25519` key with OpenSSH batch authentication. `--sftp-host`
+or `SELFHOSTED_SFTP_HOST` may override the destination. A fresh run confirms ON
+power before and after collection and refuses to turn on an intentionally OFF
+instance. Recovery may restore only its recorded original ON state. The source
+and tests never read key contents.
+
+The staged DB passes SQLite integrity checks, uses DELETE journal mode, and is
+uploaded to a unique temporary name. A downloaded copy must match its SHA-256
+before installation. The original main DB set is renamed to retained remote
+backups; old WAL/SHM cannot attach to the new DB. An atomic same-directory rename
+installs the candidate, followed by another download/hash check. Only then are
+the old generation checkpointed, fresh intent published and fresh progress
+checkpointed, using the API writer's durable primitives. `auxiliary.db` and all
+other files are untouched. This path never constructs a record API client or
+authenticates to the instance; its only instance HTTP request is `/api/health`.
+
+`writes.json.offline.json` records the exact old/fresh plans and installation
+state for crash reconciliation. Per-run captures, original DB sets, staged DBs,
+hash-check copies and receipts remain under the journal's `offline/<run-id>/`
+directory (or `--backup-dir`). Receipt and capture JSON files use mode 0600 and
+run directories use 0700. No backup is deleted. Keep these artifacts private and
+retain them until the operator explicitly chooses a retention policy.
+
+Transfer, rename, hash or checkpoint failures trigger restoration of the original
+DB set and journal cursor, then restart/health verification. SIGTERM enters the
+same cleanup path. An uncatchable kill is reconciled from the saved receipt on
+the next invocation: verify the installed hash before publishing progress, or
+restore a partial installation. After a checkpointed installation, startup
+failure retains that installation and its progress; the next invocation retries
+startup/health before collecting fresh input. A changed installed hash or failed
+rollback fails closed for operator inspection. Network outages can prevent
+cleanup; the receipt and original copies are the recovery evidence.
+Rollback persists a restart-pending boundary only after restoring the DB and
+journal. Recovery after that boundary retries startup without replacing files,
+preserving user changes made after a successful restart. A failed journal
+restoration leaves the instance stopped.
+
+Local dry runs require a synthetic DB and a captured JSON object containing
+`date`, `requested_sources`, and `rows` (RawApp dictionaries). They never fetch,
+instantiate SFTP, stop the instance, install a DB or publish journal progress.
+Successful validation exits 0 with `dry_run: true` and `success: false`.
+
+```bash
+netless python3 -m collector.offline --dry-run --db /path/to/fixture/data.db \
+  --from-collected /path/to/captured.json --state-file /path/to/test-writes.json
+```
+
+The orchestration transport exposes file listing/download/upload/rename plus
+stop/start/health, keeping a future CLI transport independent of this recovery.
+It uses existing SFTP authentication. API-key/CLI migration, timer enablement and
+live installation are separate operator actions. The daily service should allow
+1800 seconds to start and 300 seconds for termination cleanup; source collection
+happens before the downtime window. Serialize any other host or writer using a
+different journal path.
+
+## Optional API collector
+
+The manual API writer saves the complete plan locally,
 then confirms at most 200 record operations per invocation, serial by default. It never
 drops a collection because it contains more than 600 rows.
 
@@ -60,26 +139,7 @@ python3 -m collector.sync --resume      # finish saved work without fetching
 python3 -m collector.sync --max-writes 20000 --batch-size 50
 ```
 
-A systemd user timer runs this daily at 04:20 on the UTC host, **13:20 KST**
-(`selfhosted-radar-collect.timer`). The planned service runtime is
-`--max-writes 20000 --batch-size 50`; the CLI's conservative defaults remain
-200 records and serial writes.
-
-The weekly runner is planned to retain its existing filename for compatibility
-but use the same API pipeline, **without powering down the database**:
-
-```bash
-python3 -m collector.sync --sources awesome,selfhst,gh_trending,gh_popular --max-writes 60000 --batch-size 50 --max-runtime-seconds 14400
-```
-
-Daily and weekly runners must use the same durable `--state-file` (or the same
-default state directory), so the shared journal lock excludes concurrent drains.
-These runner changes are integrated separately from the collector. Pending intent
-still wins over new input: no upstream source is fetched until that plan completes.
-A normal weekly invocation then collects its requested source set in the same
-invocation if record budget remains, using only the remainder of its single cap.
-
-The normal command also resumes pending work before fetching anything new.
+The normal API command resumes pending work before fetching anything new.
 Resumed intent retains its original date and event details. A normal invocation
 that finishes it collects and plans fresh requested input with the remaining
 record budget; it never replans while pending writes remain or after exhausting
@@ -254,26 +314,11 @@ Do not delete or edit pending intent to unblock a failed row: repair the cause
 and resume. Corrupt, foreign-target, and legacy unversioned stash files are
 rejected without overwriting them. Legacy stashes require manual inspection and
 migration; the new `flush()` consumes only the versioned journal. Journal locking
-does not coordinate a separate host, a different journal path, or offline staging;
-serialize those writers too. Do not run the offline loader while an API plan is
-pending. The collector does not change schedules or deployment configuration.
-
-**Legacy offline bulk load (manual only).** The existing loader stages rows into
-PocketBase's own SQLite file while the instance is powered down. It is unsafe to
-run concurrently with a durable API journal and does not participate in that
-journal's lock. It must not remain the scheduled weekly path alongside the API
-collector. The replacement weekly API pipeline above does not power-cycle the DB.
-
-```bash
-phost off selfhosted --yes
-sftp ... # download selfhosted/pb_data/data.db
-python3 -m collector.sqlstage data.db --dump merged.json
-sftp ... # upload data.db back, instance still off
-phost on selfhosted
-```
-
-`pb_data` is reachable only while the instance is powered down, and it must be
-written while down. Daily small updates may keep using the API.
+does not coordinate a separate host or a different journal path; serialize those
+writers too. `collector.offline` shares this lock and consumes pending API intent
+before fresh planning. Do not use the legacy `collector.sqlstage` CLI to replace
+the live DB independently of this orchestration. No schedules or deployment
+configuration are changed by these modules.
 
 ## Rules the code relies on
 
@@ -307,7 +352,7 @@ written while down. Daily small updates may keep using the API.
 ## Additional sources
 
 The collector also has GitHub Trending and Popular adapters (`gh_trending` and
-`gh_popular`). The weekly API command includes both alongside the two directories;
+`gh_popular`). The weekly offline runner includes both alongside the two directories;
 the `sources` column and `surveillance_events.source` retain those source names.
 
 ## Tests
@@ -315,6 +360,12 @@ the `sources` column and `surveillance_events.source` retain those source names.
 ```bash
 netless python3 -m pytest tests -q
 ```
+
+Offline orchestration tests use migration-derived SQLite fixtures and an in-memory
+file transport. They deny sockets, subprocesses and record API construction, and
+cover online capture, old/fresh replay, scopes, WAL inclusion/removal, operation
+caps, transfer/hash/rename failures, checkpoint rollback, crash receipts, startup
+recovery, SIGTERM cleanup and local-only dry runs.
 
 Writer tests use an in-memory transport with network access denied. They cover
 snapshot persistence, rerun idempotency, more than 600 rows, failure accounting
