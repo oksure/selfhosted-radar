@@ -94,7 +94,8 @@ class SFTPTransport:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
   def health(self):
-    with urllib.request.urlopen(BASE + '/api/health', timeout=20) as response:
+    request = urllib.request.Request(BASE + '/api/health', headers=W.UA)
+    with urllib.request.urlopen(request, timeout=20) as response:
       return response.status == 200 and json.load(response).get('code') == 200
 
 

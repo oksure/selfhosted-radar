@@ -411,7 +411,7 @@ class GitHubTrending:
         except Exception:
           return fn, None
 
-      with ThreadPoolExecutor(max_workers=4) as pool:
+      with ThreadPoolExecutor(max_workers=1) as pool:
         for fn, obj in pool.map(_fetch_one, to_enrich):
           if obj:
             meta[fn] = obj

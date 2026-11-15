@@ -428,6 +428,19 @@ def test_transport_argv_existing_port_key_and_phost_scope(monkeypatch):
   assert calls[3][0] == ['phost', 'on', 'selfhosted']
 
 
+def test_health_uses_existing_pockethost_user_agent(monkeypatch):
+  import io
+  class Response(io.BytesIO):
+    status = 200
+  def urlopen(request, timeout):
+    assert request.full_url == O.BASE + '/api/health'
+    assert request.get_header('User-agent') == W.UA['User-Agent']
+    assert timeout == 20
+    return Response(b'{"code":200}')
+  monkeypatch.setattr(O.urllib.request, 'urlopen', urlopen)
+  assert O.SFTPTransport('fixture@example.invalid').health()
+
+
 def test_default_destination_uses_existing_ph_email(setup, monkeypatch, capsys):
   db, state, remote = setup
   destinations = []
