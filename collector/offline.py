@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -114,13 +116,26 @@ class CLITransport:
     self._stopped()
     present = set()
     for name, path in paths:
+      request = urllib.request.Request(
+        BASE + '/_ph/deploy/v1/files?' + urllib.parse.urlencode({'path': path, 'recursive': 0}),
+        headers=W.UA)
+      # CLI 4.3 rewrites a dotted missing filename to an instance-auth error.
+      # Inspect the original metadata response; never forward auth on redirects.
+      request.add_unredirected_header('Authorization', 'Bearer ' + self._env['POCKETHOST_TOKEN'])
       try:
-        output = self._command('files', path, '--json', '-I', 'selfhosted')
-      except subprocess.CalledProcessError as exc:
-        if exc.returncode == 1 and exc.stderr == f'Error: {path} not found\n' and not exc.stdout:
+        with urllib.request.urlopen(request, timeout=20) as response:
+          output = json.load(response)
+      except urllib.error.HTTPError as exc:
+        try:
+          error = json.load(exc)
+        except (ValueError, OSError):
+          raise RuntimeError('exact HTTPS file probe failed') from None
+        if exc.code == 404 and isinstance(error, dict) and error.get('message') == f'{path} not found':
           continue
-        raise RuntimeError('exact CLI file probe failed') from None
-      records = json.loads(output)
+        raise RuntimeError('exact HTTPS file probe failed') from None
+      if not isinstance(output, dict) or output.get('truncated') is not False:
+        raise RuntimeError('invalid exact file metadata response')
+      records = output.get('entries')
       if not isinstance(records, list) or len(records) != 1:
         raise RuntimeError('invalid exact CLI file response')
       record = records[0]

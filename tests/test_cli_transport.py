@@ -1,5 +1,6 @@
 """Official CLI transport exercised only through a synthetic command runner."""
 import json
+import io
 from pathlib import Path
 import socket
 from types import SimpleNamespace
@@ -84,6 +85,25 @@ def cli(monkeypatch, tmp_path):
   monkeypatch.setenv('PHIO_MOTHERSHIP_URL', 'https://legacy.example.invalid')
   monkeypatch.setattr(O.shutil, 'which', lambda name: '/synthetic/pockethost')
   runner = CLI()
+  def metadata(request, timeout):
+    parsed = O.urllib.parse.urlparse(request.full_url)
+    assert parsed.scheme == 'https' and parsed.netloc == 'selfhosted.pockethost.io'
+    assert parsed.path == '/_ph/deploy/v1/files' and timeout == 20
+    assert request.get_header('Authorization') == 'Bearer synthetic-token'
+    assert 'Authorization' not in request.headers
+    remote = O.urllib.parse.parse_qs(parsed.query)['path'][0]
+    try:
+      result = runner.run(['/synthetic/pockethost', 'files', remote, '--json', '-I', 'selfhosted'],
+                          env={'POCKETHOST_TOKEN': 'synthetic-token',
+                               'POCKETHOST_MOTHERSHIP_URL': 'https://mothership.pockethost.io'},
+                          check=True, capture_output=True, timeout=180)
+    except O.subprocess.CalledProcessError as exc:
+      missing = exc.returncode == 1 and exc.stderr == f'Error: {remote} not found\n' and not exc.stdout
+      code = 404 if missing else 403
+      raise O.urllib.error.HTTPError(request.full_url, code, 'probe', {},
+        io.BytesIO(json.dumps({'message': f'{remote} not found' if missing else 'unauthorized'}).encode()))
+    return io.BytesIO(json.dumps({'entries': json.loads(result.stdout), 'truncated': False}).encode())
+  monkeypatch.setattr(O.urllib.request, 'urlopen', metadata)
   monkeypatch.setattr(O.subprocess, 'run', runner.run)
   monkeypatch.setattr(O.CLITransport, 'health', lambda self: runner.on)
   transport = O.CLITransport()
@@ -155,6 +175,29 @@ def test_successful_mutation_clears_durable_marker(cli):
   fresh = O.CLITransport()
   fresh.configure(Path(str(transport._marker).removesuffix('.cli-mutation.json')))
   assert not fresh.uncertain
+
+
+def test_raw_metadata_rejects_truncation_and_unrelated_not_found(cli, monkeypatch):
+  runner, transport = cli
+  transport.stop()
+  monkeypatch.setattr(O.urllib.request, 'urlopen', lambda *a, **k:
+    io.BytesIO(b'{"entries":[],"truncated":true}'))
+  with pytest.raises(RuntimeError, match='metadata'):
+    transport.files()
+  def wrong_missing(request, **kwargs):
+    raise O.urllib.error.HTTPError(request.full_url, 404, 'missing', {},
+      io.BytesIO(b'{"message":"instance not found"}'))
+  monkeypatch.setattr(O.urllib.request, 'urlopen', wrong_missing)
+  with pytest.raises(RuntimeError, match='probe failed'):
+    transport.files()
+
+
+def test_metadata_authorization_does_not_follow_redirects(cli):
+  request = O.urllib.request.Request('https://selfhosted.pockethost.io/_ph/deploy/v1/files')
+  request.add_unredirected_header('Authorization', 'Bearer synthetic-token')
+  redirected = O.urllib.request.HTTPRedirectHandler().redirect_request(
+    request, None, 302, 'redirect', {}, 'https://example.invalid/metadata')
+  assert redirected.get_header('Authorization') is None
 
 
 @pytest.mark.parametrize('stderr,code', [('Error: unauthorized\n', 1),

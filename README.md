@@ -93,12 +93,17 @@ publishes the completed PUT, so a partially uploaded DB is never published.
 Retained `.original` and `.rejected` copies cannot be move sources or deleted.
 Only canonical DB files and unique `.upload`/`.restore` staging files can be
 removed by a verified move. All listings probe exact canonical or receipt-derived
-names; directory uploads, recursive operations and deployment are never used.
+filenames through the official HTTPS file metadata endpoint. CLI 4.3 mislabels
+missing dotted filenames as instance/auth failures. The adapter therefore reads
+the original HTTP status and exact missing-path message, and rejects truncated
+metadata. Authorization stays on the initial request only during redirects.
+Directory uploads, recursive operations and deployment are never used.
 Another download/hash check verifies installation. Only then are
 the old generation checkpointed, fresh intent published and fresh progress
 checkpointed, using the API writer's durable primitives. `auxiliary.db` and all
 other files are untouched. This path never constructs a record API client or
-authenticates to the instance; its only instance HTTP request is `/api/health`.
+authenticates with PocketBase superuser credentials. A scoped platform token
+authorizes file metadata and CLI operations. `/api/health` needs no credential.
 
 `writes.json.offline.json` records the exact old/fresh plans and installation
 state for crash reconciliation. Per-run captures, original DB sets, staged DBs,
