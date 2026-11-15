@@ -459,24 +459,6 @@ def test_sigterm_at_startup_retries_start_without_rolling_back(setup, monkeypatc
   assert journal['next'] == len(journal['operations'])
 
 
-def test_transport_argv_existing_port_key_and_phost_scope(monkeypatch):
-  calls = []
-  def command(argv, **kwargs):
-    calls.append((argv, kwargs))
-    return SimpleNamespace(stdout='{"subdomain":"selfhosted","power":true}\nlive health: HTTP 200')
-  monkeypatch.setattr(O.subprocess, 'run', command)
-  transport = O.SFTPTransport('fixture@example.invalid@ftp.pockethost.io')
-  assert transport.is_on()
-  transport._batch('ls -1 "selfhosted/pb_data/"')
-  transport.stop()
-  transport.start()
-  argv = calls[1][0]
-  assert argv[:5] == ['sftp', '-P', '2222', '-i', str(Path.home() / '.ssh/pockethost_ed25519')]
-  assert '-oIdentityAgent=none' in argv
-  assert argv[-1] == 'fixture@example.invalid@ftp.pockethost.io'
-  assert calls[0][0] == ['phost', 'status', 'selfhosted']
-  assert calls[2][0] == ['phost', 'off', 'selfhosted', '--yes']
-  assert calls[3][0] == ['phost', 'on', 'selfhosted']
 
 
 def test_health_uses_existing_pockethost_user_agent(monkeypatch):
@@ -489,7 +471,9 @@ def test_health_uses_existing_pockethost_user_agent(monkeypatch):
     assert timeout == 20
     return Response(b'{"code":200}')
   monkeypatch.setattr(O.urllib.request, 'urlopen', urlopen)
-  assert O.SFTPTransport('fixture@example.invalid').health()
+  monkeypatch.setenv('POCKETHOST_TOKEN', 'synthetic-token')
+  monkeypatch.setattr(O.shutil, 'which', lambda name: '/synthetic/pockethost')
+  assert O.CLITransport().health()
 
 
 def test_default_destination_uses_cli_without_sftp_fallback(setup, monkeypatch, capsys):

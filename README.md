@@ -75,8 +75,7 @@ tokens are not required. The Radar writer still targets `selfhosted` explicitly.
 It copies the environment for the CLI child. Credentials never enter arguments,
 receipts or output. The child's `POCKETHOST_MOTHERSHIP_URL` is pinned to
 `https://mothership.pockethost.io`, overriding inherited current or legacy URL
-settings. There is no SFTP fallback. The old `SFTPTransport` class is
-available only to explicit legacy Python callers. A fresh run confirms ON
+settings. There is no SFTP transport or fallback. A fresh run confirms ON
 power before and after collection and refuses to turn on an intentionally OFF
 instance. Recovery may restore only its recorded original ON state. The source
 and tests never read key contents. Incomplete receipts from the legacy transport

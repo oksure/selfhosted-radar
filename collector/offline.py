@@ -7,7 +7,7 @@ from datetime import date
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import shutil
 import signal
@@ -207,73 +207,6 @@ class CLITransport:
       return response.status == 200 and json.load(response).get('code') == 200
 
 
-class SFTPTransport:
-  """Replaceable file/control seam; OpenSSH configuration owns authentication.
-
-  No remove operation is exposed. Only the operator runs the live transport.
-  """
-  def __init__(self, host, remote_dir='selfhosted/pb_data'):
-    if not re.fullmatch(r'[A-Za-z0-9_@.+%:-]+', host) or host.startswith('-'):
-      raise ValueError('invalid SFTP destination')
-    if remote_dir.rstrip('/') not in ('selfhosted/pb_data', '/selfhosted/pb_data'):
-      raise ValueError('only selfhosted/pb_data may be managed')
-    self.host, self.remote_dir = host, remote_dir.rstrip('/')
-    self.identity = {'host': host, 'remote_dir': self.remote_dir}
-
-  @staticmethod
-  def _quote(value):
-    value = str(value)
-    if any(c in value for c in ('\n', '\r', '\x00', '*', '?', '[', ']')):
-      raise ValueError('invalid SFTP path')
-    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
-
-  def _remote(self, name):
-    if PurePosixPath(name).name != name or not name.startswith('data.db'):
-      raise ValueError('only the main database set may be transferred')
-    return self.remote_dir + '/' + name
-
-  def _batch(self, command):
-    result = subprocess.run(['sftp', '-P', '2222', '-i', str(Path.home() / '.ssh/pockethost_ed25519'),
-                             '-oIdentitiesOnly=yes', '-oIdentityAgent=none',
-                             '-oBatchMode=yes', '-oConnectTimeout=20',
-                             '-b', '-', self.host], input=command + '\n',
-                            text=True, capture_output=True, timeout=60, check=True)
-    return result.stdout
-
-  def files(self, names=DBSET):
-    output = self._batch('ls -1 ' + self._quote(self.remote_dir + '/'))
-    return {PurePosixPath(line.strip()).name for line in output.splitlines()
-            if not line.startswith('sftp>') and line.strip()} & set(names)
-
-  def download(self, name, path):
-    self._batch('get ' + self._quote(self._remote(name)) + ' ' + self._quote(path))
-
-  def upload(self, path, name):
-    self._batch('put ' + self._quote(path) + ' ' + self._quote(self._remote(name)))
-
-  def rename(self, old, new):
-    self._batch('rename ' + self._quote(self._remote(old)) + ' ' + self._quote(self._remote(new)))
-
-  def stop(self):
-    subprocess.run(['phost', 'off', 'selfhosted', '--yes'], check=True, timeout=60,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-  def is_on(self):
-    result = subprocess.run(['phost', 'status', 'selfhosted'], check=True, timeout=60,
-                            text=True, capture_output=True)
-    record, _ = json.JSONDecoder().raw_decode(result.stdout.lstrip())
-    if record.get('subdomain') != 'selfhosted' or type(record.get('power')) is not bool:
-      raise RuntimeError('instance power state was not confirmed')
-    return record['power']
-
-  def start(self):
-    subprocess.run(['phost', 'on', 'selfhosted'], check=True, timeout=180,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-  def health(self):
-    request = urllib.request.Request(BASE + '/api/health', headers=W.UA)
-    with urllib.request.urlopen(request, timeout=20) as response:
-      return response.status == 200 and json.load(response).get('code') == 200
 
 
 def digest(path):

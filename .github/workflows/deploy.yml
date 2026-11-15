@@ -1,13 +1,5 @@
 name: Deploy to PocketHost
 
-# PocketHost sunsets FTPS on port 21; SFTP on 2222 with an Ed25519 key is the
-# supported transport. Only the three code folders are mirrored — pb_data is
-# never touched by CI, and bulk data loads go through the offline SQLite path
-# (see collector/sqlstage.py) with the instance powered off.
-#
-# Secrets: PH_SFTP_USER (PocketHost account email),
-#          PH_SFTP_KEY  (Ed25519 private key registered at Account > Keys).
-
 on:
   push:
     branches: [main]
@@ -15,44 +7,35 @@ on:
       - 'pb_public/**'
       - 'pb_hooks/**'
       - 'pb_migrations/**'
+      - '.github/deploy/**'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        instance: [selfhosted]
+    concurrency:
+      group: pockethost-${{ matrix.instance }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify project structure
-        run: |
-          for folder in pb_public pb_hooks pb_migrations; do
-            test -d "./$folder" || { echo "missing $folder"; exit 1; }
-          done
-
-      - name: Install lftp
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
-
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.PH_SFTP_KEY }}" > ~/.ssh/pockethost_ed25519
-          chmod 600 ~/.ssh/pockethost_ed25519
-
-      # Key auth only; the dummy password stops lftp from prompting, and
-      # BatchMode makes ssh fail loud rather than hang.
-      - name: Mirror code folders over SFTP
-        run: |
-          cat > /tmp/lftp.rc <<RC
-          set sftp:connect-program 'ssh -a -x -i $HOME/.ssh/pockethost_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes'
-          set sftp:auto-confirm yes
-          set net:timeout 20
-          set net:max-retries 2
-          open -u "$PH_SFTP_USER,dummy" sftp://ftp.pockethost.io:2222
-          RC
-          for folder in pb_public pb_hooks pb_migrations; do
-            echo "── mirror $folder"
-            lftp -c "source /tmp/lftp.rc; mirror -R --delete --no-perms --verbose ./$folder/ selfhosted/$folder/; bye"
-          done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install official CLI
+        run: npm install --global pockethost@4.3.0
+      - name: Test deployment guard
+        run: sudo unshare --net python3 -B -m unittest discover -s .github/deploy -p 'test_*.py' -v
+      - name: Deploy code folders
         env:
-          PH_SFTP_USER: ${{ secrets.PH_SFTP_USER }}
+          POCKETHOST_TOKEN: ${{ secrets.POCKETHOST_TOKEN }}
+        run: python3 .github/deploy/deploy-code.py "${{ matrix.instance }}" "."
