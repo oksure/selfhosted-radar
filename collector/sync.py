@@ -8,8 +8,9 @@
 Writes are bounded and journaled (serial by default). An incomplete run exits nonzero and can be
 resumed without fetching upstream. Bulk loads still use collector.sqlstage.
 
-Credentials come from the environment (``SELFHOSTED_PB_EMAIL`` /
-``SELFHOSTED_PB_PASS``), never from the repository.
+Credentials come from a complete ``SELFHOSTED_PB_EMAIL`` / ``SELFHOSTED_PB_PASS``
+environment pair, or the local shared helper for the canonical selfhosted URL.
+Custom URLs require an explicit pair. Dry runs do not resolve credentials.
 """
 import argparse
 import json
@@ -104,8 +105,12 @@ def main(argv=None):
   today = a.today or date.today().isoformat()
 
   email, pwd = os.environ.get('SELFHOSTED_PB_EMAIL'), os.environ.get('SELFHOSTED_PB_PASS')
-  if not a.dry_run and not (email and pwd):
-    print('SELFHOSTED_PB_EMAIL / SELFHOSTED_PB_PASS missing (source agent-env.sh)', file=sys.stderr)
+  from .pbwrite import credentials
+  try:
+    if not a.dry_run:
+      email, pwd = credentials(BASE, email, pwd)
+  except (ValueError, RuntimeError):
+    print('PocketBase credentials unavailable; use a complete explicit pair or the local helper', file=sys.stderr)
     print(json.dumps({'complete': False, 'success': False, 'errors': 1, 'pending': None,
                       'phase': 'credentials', 'error_type': 'MissingCredentials',
                       'failure_reasons': ['credentials_failure']}))

@@ -411,3 +411,5 @@ checkpoints, failed immutable reads, and narrowly indexed icon fallback.
 Fake-clock quota tests cover startup before login, multiple quota windows, scoped
 header validation, bounded waits, request accounting, deadline stops, mutation
 429s and timeouts, and preserved journal intent and confirmed progress.
+
+Local PocketBase record writes resolve the selected selfhosted automation identity through `~/dotfiles/python/pb_credentials.py` when neither explicit email nor password is supplied. Separate deployments may continue supplying a complete `SELFHOSTED_PB_EMAIL`/`SELFHOSTED_PB_PASS` pair. Partial credentials fail before authentication. This does not change the shared `POCKETHOST_TOKEN` used for platform file transfers.

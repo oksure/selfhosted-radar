@@ -1,6 +1,7 @@
 """Bounded PocketBase writes backed by a durable, replayable local journal."""
 import fcntl
 import hashlib
+import importlib
 import http.client
 import json
 import math
@@ -204,8 +205,33 @@ def _source_scope(names):
   return sorted(set(names))
 
 
+def credentials(base, email=None, password=None):
+  """Keep explicit pairs; resolve only the canonical local selfhosted target."""
+  if email is not None or password is not None:
+    if not email or not password:
+      raise ValueError('SELFHOSTED_PB_EMAIL / SELFHOSTED_PB_PASS must be a complete pair')
+    return email, password
+  if base.rstrip('/') != 'https://selfhosted.pockethost.io':
+    raise ValueError('custom PocketBase URLs require explicit credentials')
+  helper = Path.home() / 'dotfiles/python'
+  if not (helper / 'pb_credentials.py').is_file():
+    raise RuntimeError('local PocketBase credential helper unavailable')
+  sys.path.insert(0, str(helper))
+  try:
+    selected = importlib.import_module('pb_credentials').resolve('selfhosted')
+    if (selected.url.rstrip('/') != base.rstrip('/')
+        or not selected.email or not selected.password):
+      raise ValueError('invalid selected credentials')
+    return selected.email, selected.password
+  except Exception:
+    raise RuntimeError('local PocketBase credentials unavailable') from None
+  finally:
+    sys.path.pop(0)
+
+
 class PB:
-  def __init__(self, base, email, password, quiet=False, budget=None):
+  def __init__(self, base, email=None, password=None, quiet=False, budget=None):
+    email, password = credentials(base, email, password)
     self.base = base.rstrip('/')
     self.quiet = quiet
     self.token = None

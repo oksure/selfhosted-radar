@@ -1248,7 +1248,8 @@ def test_atomic_initial_state_drains_published_work_before_upstream_failure(db, 
   assert saved(db)['next'] == 4
 
 
-def test_missing_credentials_has_safe_json_and_exit_two(monkeypatch, capsys):
+def test_missing_credentials_has_safe_json_and_exit_two(monkeypatch, capsys, tmp_path):
+  monkeypatch.setattr(Path, 'home', lambda: tmp_path)
   monkeypatch.delenv('SELFHOSTED_PB_EMAIL', raising=False)
   monkeypatch.delenv('SELFHOSTED_PB_PASS', raising=False)
   assert sync.main(['--sources', 'awesome']) == 2
