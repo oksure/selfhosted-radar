@@ -380,6 +380,17 @@ configuration are changed by these modules.
 - No scheduled health ping or uptime monitor; a PocketHost writer invocation uses
   one health GET to acquire quota before login.
 
+## Transport failures
+
+Requirements for the PocketHost CLI transport in `collector/offline.py`. They are not implemented yet.
+
+1. A failed CLI command keeps its kind (timeout, non-zero exit with the code, or signal) and the last 20 lines of stderr in the run receipt. Secret values are masked before they are written.
+2. The command timeout scales with the file size: 180 seconds base plus 60 seconds per 25 MB, upper limit 900 seconds. The timeout used is recorded in the receipt.
+3. A `reconcile` subcommand reads the receipt and the remote state without writing. It prints one of `applied`, `not-applied` or `unknown`. It clears the pending marker only when an explicit flag is given.
+4. After every mutating run the collector calls the instance health address and records the result. A failed post-check ends the run with a non-zero exit.
+5. The job has its own Healthchecks slug.
+6. Each rule above has a test that runs without network access (`netless`).
+
 ## Additional sources
 
 The collector also has GitHub Trending and Popular adapters (`gh_trending` and
