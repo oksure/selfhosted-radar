@@ -8,7 +8,7 @@ import pytest
 from collector import offline as O, pbwrite as W
 from test_offline import schema, rows, TODAY, BASE
 
-USER = 'fixture'
+USER = 'fixture@example.invalid'
 HOST = USER + '@ftp.pockethost.io'
 REMOTE = 'selfhosted/pb_data'
 
@@ -94,7 +94,6 @@ def cli(monkeypatch, tmp_path):
   monkeypatch.setattr(O.urllib.request, 'urlopen', blocked)
   monkeypatch.setattr(W.PB, '__init__', blocked)
   monkeypatch.setenv('POCKETHOST_SFTP_USER', USER)
-  monkeypatch.delenv('PH_EMAIL', raising=False)
   monkeypatch.delenv('ICLOUD_EMAIL', raising=False)
   runner = Runner()
   monkeypatch.setattr(O.subprocess, 'run', runner.run)
@@ -141,7 +140,7 @@ def test_constructor_requires_an_sftp_user(monkeypatch):
     O.SFTPTransport()
 
 
-@pytest.mark.parametrize('user', ['fixture', 'a.b+c'])
+@pytest.mark.parametrize('user', ['fixture@example.invalid', 'a.b+c@x.invalid'])
 def test_constructor_accepts_configured_user(monkeypatch, user):
   monkeypatch.setenv('POCKETHOST_SFTP_USER', user)
   transport = O.SFTPTransport()
@@ -149,14 +148,17 @@ def test_constructor_accepts_configured_user(monkeypatch, user):
   assert transport.remote_dir == REMOTE
 
 
-@pytest.mark.parametrize('configured,expected', [
-  ('owner', 'owner@ftp.pockethost.io'),
-  ('owner@example.com', 'owner@ftp.pockethost.io'),
-])
-def test_constructor_falls_back_to_ph_email_local_part(monkeypatch, configured, expected):
+def test_constructor_falls_back_to_the_full_ph_email(monkeypatch):
   monkeypatch.delenv('POCKETHOST_SFTP_USER', raising=False)
-  monkeypatch.setenv('PH_EMAIL', configured)
-  assert O.SFTPTransport().host == expected
+  monkeypatch.setenv('PH_EMAIL', 'owner@example.com')
+  # The SFTP login is the full address, not its local part.
+  assert O.SFTPTransport().host == 'owner@example.com@ftp.pockethost.io'
+
+
+def test_constructor_rejects_a_bare_local_part(monkeypatch):
+  monkeypatch.setenv('POCKETHOST_SFTP_USER', 'owner')
+  with pytest.raises(ValueError, match='SFTP destination'):
+    O.SFTPTransport()
 
 
 def test_constructor_rejects_other_remote_dirs(monkeypatch):
