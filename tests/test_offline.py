@@ -471,7 +471,7 @@ def test_health_uses_existing_pockethost_user_agent(monkeypatch):
     assert timeout == 20
     return Response(b'{"code":200}')
   monkeypatch.setattr(O.urllib.request, 'urlopen', urlopen)
-  monkeypatch.setenv('POCKETHOST_SFTP_USER', 'fixture')
+  monkeypatch.setenv('POCKETHOST_SFTP_USER', 'fixture@example.invalid')
   assert O.SFTPTransport().health()
 
 
