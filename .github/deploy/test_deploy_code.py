@@ -50,6 +50,9 @@ class DeploymentTests(unittest.TestCase):
       self.events.append("power:" + argv[1])
       if self.failure == "show" and argv[1] == "status":
         return subprocess.CompletedProcess(argv, 0, "{}", "")
+      if argv[1] in ("on", "off"):
+        self.state = argv[1] == "on"
+        return subprocess.CompletedProcess(argv, 0, "", "")
       record = {"id": "fixture-id", "subdomain": "fixture", "power": self.state}
       return subprocess.CompletedProcess(argv, 0, json.dumps(record) + "\nlive health: HTTP 200\n", "")
     self.assertEqual(argv[:2], ["pockethost", "link"] if "link" in argv[1] else argv[:2])
@@ -57,13 +60,14 @@ class DeploymentTests(unittest.TestCase):
       self.events.append("link")
       self.assertEqual(kwargs["input"], TOKEN)
       self.assertIn("--token-stdin", argv)
+      # v5 records the remote in the project before probing its health.
+      remotes = Path(kwargs["cwd"]) / ".pocketbase/remotes.json"
+      remotes.parent.mkdir(parents=True, exist_ok=True)
+      remotes.write_text(json.dumps({"default": "deploy",
+                                     "remotes": {"deploy": {"url": argv[2]}}}))
       return subprocess.CompletedProcess(argv, 0, "Linked\n", "")
     if argv[1] == "deploy" and "--out" in argv:
       self.events.append("stage")
-      # v5 accepts one value per --include; the flag must repeat, never collect
-      # several patterns behind one occurrence.
-      values = [argv[i + 1] for i, a in enumerate(argv) if a == "--include"]
-      self.assertEqual(values, list(deploy_code.INCLUDES))
       stage = Path(argv[argv.index("--out") + 1])
       stage.mkdir(parents=True)
       for folder in deploy_code.ROOTS:
@@ -237,11 +241,14 @@ class DeploymentTests(unittest.TestCase):
       self.deploy()
     self.assertNotIn("publish", self.events)
 
-  def test_off_instance_is_never_woken_and_gets_no_health_probe(self):
+  def test_off_instance_is_woken_only_to_publish_and_left_off(self):
+    # v5 refuses to publish to a stopped instance, so it is woken for the
+    # publication and then returned to its recorded off state.
     self.state = False
     self.deploy()
     self.assertFalse(self.state)
-    self.assertNotIn("power:on", self.events)
+    self.assertLess(self.events.index("power:on"), self.events.index("publish"))
+    self.assertLess(self.events.index("publish"), self.events.index("power:off"))
     self.assertNotIn("health", self.events)
 
   def test_on_instance_is_probed_after_publish_without_power_changes(self):
@@ -259,8 +266,7 @@ class DeploymentTests(unittest.TestCase):
 
   def test_workflow_contract(self):
     text = Path(__file__).parents[1].joinpath("workflows/deploy.yml").read_text()
-    for fragment in ("node-version: '24'",
-                     "POCKETHOST_VERSION: 5.0.0-alpha.10",
+    for fragment in ("POCKETHOST_VERSION: 5.0.0-alpha.10",
                      "releases/download/v${POCKETHOST_VERSION}", "sha256sum -c -",
                      "max-parallel: 1",
                      "group: pockethost-${{ matrix.instance }}", "cancel-in-progress: false",

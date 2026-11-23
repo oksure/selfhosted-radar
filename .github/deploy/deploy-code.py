@@ -189,8 +189,12 @@ def link(instance, cwd, env):
       input=env["P1_TOKEN"])
   except (OSError, subprocess.TimeoutExpired) as exc:
     raise DeployError("PocketHost login failed") from exc
-  if result.returncode:
+  # A powered-off instance still saves the remote and accepts a deploy; link
+  # merely cannot probe its health, so that one message is not a login failure.
+  if result.returncode and "is powered off" not in result.stderr:
     raise DeployError("PocketHost login failed")
+  if not (cwd / ".pocketbase/remotes.json").is_file():
+    raise DeployError("PocketHost login did not record the remote")
 
 
 def deploy(instance, source):
@@ -259,6 +263,10 @@ def deploy(instance, source):
     if any(path.startswith(("pb_data", "pb_cache")) for path in files):
       raise DeployError("The deploy set must never contain pb_data or pb_cache")
     original = power(instance)
+    # v5 refuses to publish to a stopped instance (4.3 accepted it). Wake it
+    # just for the publication, then restore the recorded state below.
+    if original is False:
+      restore_power(instance, True)
     check(instance, token, files)
     if manifest(stage) != files:
       raise DeployError("Stage changed after the scope check")
