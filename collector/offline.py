@@ -7,7 +7,7 @@ from datetime import date
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
@@ -16,8 +16,6 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
-import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 
@@ -42,53 +40,78 @@ class ReceiptTargetMismatch(RuntimeError):
   pass
 
 
-class CLITransport:
-  """Official single-file CLI, scoped to the stopped Radar main DB set."""
-  identity = {'transport': 'pockethost-cli', 'instance': 'selfhosted', 'remote_dir': 'pb_data'}
+class SFTPTransport:
+  """Power through phost, stopped pb_data files through PocketHost SFTP.
 
-  def __init__(self):
-    token = os.environ.get('POCKETHOST_TOKEN')
-    executable = shutil.which('pockethost')
-    if not token or not executable:
-      raise RuntimeError('managed POCKETHOST_TOKEN and pockethost CLI required')
-    self._env = dict(os.environ, POCKETHOST_TOKEN=token,
-                     POCKETHOST_MOTHERSHIP_URL='https://mothership.pockethost.io')
-    self._executable = executable
+  PocketHost retired ph_pat_ tokens on 2026-11-21 for pbt_ tokens, and the
+  npm pockethost 4.3 CLI cannot spend them, so its show/power/pull/upload/rm
+  surface is gone. The v5 CLI (5.0.0-alpha.9) deploys code only and has no
+  power control, so this seam splits in two: `phost` (mothership user auth)
+  owns power, and SFTP owns the main database set. SFTP renames natively, so a
+  move is one server-side operation instead of download/upload/remove.
+
+  No remove operation is exposed. Only the operator runs the live transport.
+  """
+  identity = {'transport': 'phost-sftp', 'instance': 'selfhosted', 'remote_dir': 'selfhosted/pb_data'}
+
+  def __init__(self, host=None, remote_dir='selfhosted/pb_data'):
+    user = (os.environ.get('POCKETHOST_SFTP_USER') or os.environ.get('PH_EMAIL')
+            or os.environ.get('ICLOUD_EMAIL') or '')
+    host = host or (user + '@ftp.pockethost.io')
+    if (not re.fullmatch(r'[A-Za-z0-9_.+%-]+@ftp\.pockethost\.io', host)
+        or host.startswith('-')):
+      raise ValueError('invalid SFTP destination; set POCKETHOST_SFTP_USER or PH_EMAIL')
+    if remote_dir.rstrip('/') not in ('selfhosted/pb_data', '/selfhosted/pb_data'):
+      raise ValueError('only selfhosted/pb_data may be managed')
+    self.host, self.remote_dir = host, remote_dir.rstrip('/')
     self.uncertain = False
     self._marker = None
 
   def configure(self, path):
-    marker = Path(str(path) + '.cli-mutation.json')
+    marker = Path(str(path) + '.sftp-mutation.json')
     if marker.exists():
       record = json.loads(marker.read_text())
       if (record.get('version') != 1 or record.get('transport') != self.identity
           or type(record.get('pending')) is not bool):
-        raise RuntimeError('invalid CLI mutation marker')
+        raise RuntimeError('invalid SFTP mutation marker')
       if record['pending']:
         self.uncertain = True
     if self.uncertain:
-      raise MutationUncertain('unfinished CLI mutation requires operator reconciliation')
+      raise MutationUncertain('unfinished SFTP mutation requires operator reconciliation')
     self._marker = marker
 
-  @staticmethod
-  def _remote(name):
+  def _remote(self, name):
     if not isinstance(name, str) or not re.fullmatch(
         r'data\.db(?:-wal|-shm)?(?:\.offline-[0-9a-f]{32}\.(?:original|rejected|upload|restore))?', name):
       raise ValueError('only known main database filenames may be managed')
-    return 'pb_data/' + name
+    return self.remote_dir + '/' + name
 
-  def _command(self, *args, mutation=False):
+  @staticmethod
+  def _quote(value):
+    value = str(value)
+    if any(c in value for c in ('\n', '\r', '\x00', '*', '?', '[', ']', '"', '\\')):
+      raise ValueError('invalid SFTP path')
+    return '"' + value + '"'
+
+  def _sftp(self, commands, mutation=False):
+    """Run one batch. A mutation is journaled first; its outcome may be unknown."""
     if self.uncertain:
-      raise MutationUncertain('CLI mutation outcome uncertain; operator reconciliation required')
-    record = {'version': 1, 'transport': self.identity, 'pending': True, 'command': args[0]}
+      raise MutationUncertain('SFTP mutation outcome uncertain; operator reconciliation required')
+    record = {'version': 1, 'transport': self.identity, 'pending': True,
+              'command': commands[0].split()[0] if commands else ''}
     if mutation:
       if self._marker is None:
-        raise RuntimeError('CLI mutation requires a recorded journal context')
+        raise RuntimeError('SFTP mutation requires a recorded journal context')
       W._save(self._marker, record)
       self.uncertain = True
     try:
-      result = subprocess.run([self._executable, *args], env=self._env, text=True,
-                              capture_output=True, timeout=180, check=True)
+      result = subprocess.run(
+        ['sftp', '-P', '2222', '-i', str(Path.home() / '.ssh/pockethost_ed25519'),
+         '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes',
+         '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20',
+         '-b', '-', self.host],
+        input='\n'.join(commands) + '\n', text=True, capture_output=True,
+        timeout=300, check=True)
       if mutation:
         W._save(self._marker, dict(record, pending=False))
         self.uncertain = False
@@ -96,11 +119,37 @@ class CLITransport:
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Interrupted, KeyboardInterrupt):
       if mutation:
         self.uncertain = True
-        raise MutationUncertain('CLI mutation outcome uncertain; operator reconciliation required') from None
+        raise MutationUncertain('SFTP mutation outcome uncertain; operator reconciliation required') from None
+      raise
+
+  def _power(self, args, mutation=False):
+    if self.uncertain:
+      raise MutationUncertain('SFTP mutation outcome uncertain; operator reconciliation required')
+    record = {'version': 1, 'transport': self.identity, 'pending': True, 'command': args[0]}
+    if mutation:
+      if self._marker is None:
+        raise RuntimeError('power mutation requires a recorded journal context')
+      W._save(self._marker, record)
+      self.uncertain = True
+    try:
+      result = subprocess.run(['phost', *args], text=True, capture_output=True,
+                              timeout=180, check=True)
+      if mutation:
+        W._save(self._marker, dict(record, pending=False))
+        self.uncertain = False
+      return result.stdout
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Interrupted, KeyboardInterrupt):
+      if mutation:
+        self.uncertain = True
+        raise MutationUncertain('power mutation outcome uncertain; operator reconciliation required') from None
       raise
 
   def is_on(self):
-    record = json.loads(self._command('show', 'selfhosted', '--json'))
+    result = self._power(['status', 'selfhosted'])
+    try:
+      record, _ = json.JSONDecoder().raw_decode(result.lstrip())
+    except ValueError:
+      raise RuntimeError('instance power state was not confirmed') from None
     if (not isinstance(record, dict) or record.get('subdomain') != 'selfhosted'
         or record.get('id') != '2sb1xkspblek1f5' or type(record.get('power')) is not bool):
       raise RuntimeError('instance power state was not confirmed')
@@ -112,54 +161,24 @@ class CLITransport:
 
   def files(self, names=DBSET):
     names = tuple(names)
-    paths = [(name, self._remote(name)) for name in names]
+    for name in names:
+      self._remote(name)
     self._stopped()
-    present = set()
-    for name, path in paths:
-      request = urllib.request.Request(
-        BASE + '/_ph/deploy/v1/files?' + urllib.parse.urlencode({'path': path, 'recursive': 0}),
-        headers=W.UA)
-      # CLI 4.3 rewrites a dotted missing filename to an instance-auth error.
-      # Inspect the original metadata response; never forward auth on redirects.
-      request.add_unredirected_header('Authorization', 'Bearer ' + self._env['POCKETHOST_TOKEN'])
-      try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-          output = json.load(response)
-      except urllib.error.HTTPError as exc:
-        try:
-          error = json.load(exc)
-        except (ValueError, OSError):
-          raise RuntimeError('exact HTTPS file probe failed') from None
-        if exc.code == 404 and isinstance(error, dict) and error.get('message') == f'{path} not found':
-          continue
-        raise RuntimeError('exact HTTPS file probe failed') from None
-      if not isinstance(output, dict) or output.get('truncated') is not False:
-        raise RuntimeError('invalid exact file metadata response')
-      records = output.get('entries')
-      if not isinstance(records, list) or len(records) != 1:
-        raise RuntimeError('invalid exact CLI file response')
-      record = records[0]
-      if (not isinstance(record, dict) or record.get('path') != path
-          or record.get('isDirectory') is not False
-          or type(record.get('size')) is not int or record['size'] < 0
-          or type(record.get('mtime')) not in (str, int, float) or record['mtime'] == ''):
-        raise RuntimeError('invalid exact CLI file response')
-      present.add(name)
-    return present
+    output = self._sftp(['ls -1 ' + self._quote(self.remote_dir + '/')])
+    present = {PurePosixPath(line.strip()).name for line in output.splitlines()
+               if not line.startswith('sftp>') and line.strip()}
+    return present & set(names)
 
   def download(self, name, path):
     remote = self._remote(name)
-    if name not in self.files((name,)):
-      raise RuntimeError('exact CLI download source is missing')
-    # A fresh private destination defeats the CLI's mtime/size skip optimization.
-    with tempfile.TemporaryDirectory(prefix='radar-pull-') as directory:
-      self._command('pull', remote, '--data', '-d', directory, '-I', 'selfhosted')
-      source = Path(directory) / remote
-      if source.is_symlink() or not source.is_file() or source.parent.is_symlink():
-        raise RuntimeError('CLI pull did not produce the exact regular file')
-      shutil.copyfile(source, path)
-      with Path(path).open('rb') as ff:
-        os.fsync(ff.fileno())
+    self._stopped()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    self._sftp(['get ' + self._quote(remote) + ' ' + self._quote(path)])
+    if path.is_symlink() or not path.is_file():
+      raise RuntimeError('SFTP get did not produce the exact regular file')
+    with path.open('rb') as ff:
+      os.fsync(ff.fileno())
 
   def upload(self, path, name):
     remote = self._remote(name)
@@ -167,7 +186,8 @@ class CLITransport:
       raise ValueError('uploads require a single file and a unique staging name')
     if name in self.files((name,)):
       raise RuntimeError('upload staging destination already exists')
-    self._command('upload', str(path), remote, '-I', 'selfhosted', mutation=True)
+    self._sftp(['put ' + self._quote(path) + ' ' + self._quote(remote)],
+               mutation=True)
 
   def rename(self, old, new):
     source, destination = self._remote(old), self._remote(new)
@@ -178,28 +198,21 @@ class CLITransport:
         (new == canonical and old.startswith(canonical + '.offline-')
          and old.endswith(('.upload', '.restore')))):
       raise ValueError('retained files cannot be move sources')
-    if new in self.files((new,)):
+    files = self.files((old, new))
+    if old not in files:
+      raise RuntimeError('move source is missing')
+    if new in files:
       raise RuntimeError('move destination already exists')
-    with tempfile.TemporaryDirectory(prefix='radar-move-') as directory:
-      local = Path(directory) / 'source'
-      self.download(old, local)
-      expected = digest(local)
-      # The official server atomically publishes a completed single-file PUT.
-      self._stopped()
-      self._command('upload', str(local), destination, '-I', 'selfhosted', mutation=True)
-      _checked_download(self, new, Path(directory) / 'destination-check', expected)
-      _checked_download(self, old, Path(directory) / 'source-check', expected)
-      self._stopped()
-      self._command('rm', source, '-I', 'selfhosted', mutation=True)
-      if old in self.files((old,)):
-        raise RuntimeError('move source removal was not confirmed')
+    # SFTP rename is server-side and atomic; a failed batch leaves the source.
+    self._sftp(['rename ' + self._quote(source) + ' '
+                + self._quote(destination)], mutation=True)
 
   def stop(self):
-    self._command('power', 'off', 'selfhosted', '--wait', mutation=True)
+    self._power(['off', 'selfhosted', '--yes'], mutation=True)
     self._stopped()
 
   def start(self):
-    self._command('power', 'on', 'selfhosted', mutation=True)
+    self._power(['on', 'selfhosted'], mutation=True)
 
   def health(self):
     request = urllib.request.Request(BASE + '/api/health', headers=W.UA)
@@ -584,7 +597,7 @@ def main(argv=None):
         result = dry_run(args.db, args.state_file, collect_rows(names), names, args.today,
                          directory, args.max_writes)
     else:
-      result = run(CLITransport(), args.state_file, collect_rows,
+      result = run(SFTPTransport(), args.state_file, collect_rows,
                    names, args.today, max_writes=args.max_writes, backup_dir=args.backup_dir)
     print(json.dumps(result))
     return 0

@@ -45,66 +45,68 @@ tests/         merge, delta and adapter tests
 
 Daily and weekly bulk runs use `collector.offline`. Sources are captured while
 the site is online. Under the API writer's existing journal lock, it stops only
-`selfhosted` with the official `pockethost` CLI, freshly downloads the stopped `data.db` and any WAL/SHM,
+`selfhosted`, freshly downloads the stopped `data.db` and any WAL/SHM over SFTP,
 and preserves them locally. SQLite's backup API builds a separate staging DB,
 including WAL content. Pending intent is replayed with its exact saved IDs, then
 fresh requested input is planned through `SQLiteInventory` and applied through
 `apply_journal`. Neither SQL replay nor staging advances journal progress.
 
 ```bash
-# Managed POCKETHOST_TOKEN; official CLI 4.3.0 on Node 24+ in PATH.
+# phost for power, PocketHost SFTP for pb_data, PH_EMAIL for the SFTP user.
 source ~/dotfiles/claude/hooks/agent-env.sh
 python3 -m collector.offline --sources awesome,selfhst,gh_trending
 bash collector/run_daily.sh
 bash collector/run_weekly_sqlstage.sh  # adds gh_popular
 ```
 
-Both runners share `${XDG_STATE_HOME:-~/.local/state}/selfhosted-radar/writes.json`
-by default, also configurable with `--state-file`. `--max-writes` defaults to
-100,000 offline operations across pending and fresh plans; it is independent of
-the API's 200-operation default. Insufficient capacity fails without installing
-partial fresh scope. Requested adapters that return no entries remain recorded
-in the fresh scope. Only fresh scope plus installed DB plus successful restart
-and health check produces `success: true` and exit 0.
+## Transport
 
-Both runners source the existing `agent-env.sh`. The default transport requires
-the managed `POCKETHOST_TOKEN` environment variable and resolves
-`pockethost` before stopping anything. One shared platform token has read/write
-access to all instances, including future instances. Instance-specific platform
-tokens are not required. The Radar writer still targets `selfhosted` explicitly.
-It copies the environment for the CLI child. Credentials never enter arguments,
-receipts or output. The child's `POCKETHOST_MOTHERSHIP_URL` is pinned to
-`https://mothership.pockethost.io`, overriding inherited current or legacy URL
-settings. There is no SFTP transport or fallback. A fresh run confirms ON
-power before and after collection and refuses to turn on an intentionally OFF
-instance. Recovery may restore only its recorded original ON state. The source
-and tests never read key contents. Incomplete receipts from the legacy transport
-fail with a target mismatch; completed receipts remain accepted.
+PocketHost retired `ph_pat_` tokens on 2026-11-21 in favour of `pbt_` tokens,
+and the npm `pockethost` 4.3 CLI cannot spend them, so its `show`/`power`/`pull`/
+`upload`/`rm` surface is gone. The v5 CLI deploys code but has no power control
+and never touches `pb_data`. The transport therefore splits in two:
+
+- **Power** goes through `phost` (mothership user auth via `PH_EMAIL`/
+  `PH_PASSWORD`).
+- **`pb_data` files** go through PocketHost SFTP on port 2222 with
+  `~/.ssh/pockethost_ed25519`, using the instance's `selfhosted/pb_data`
+  directory. The SFTP user comes from `POCKETHOST_SFTP_USER`, else `PH_EMAIL`.
+  PocketHost retires SFTP on 2027-02-06.
+
+`SFTPTransport` keeps the previous safety contract: the same canonical file
+name allowlist, the same credential-free mutation marker, and the same
+stopped-instance requirement. SFTP renames natively, so one logical move is a
+single server-side `rename` instead of a pull/upload/remove cycle. The
+destination must be absent and the source present before the rename runs.
+
+Both runners source the existing `agent-env.sh`. A fresh run confirms ON power
+before and after collection and refuses to turn on an intentionally OFF
+instance. Recovery may restore only its recorded original ON state. Credentials
+never enter arguments, receipts or output. Incomplete receipts from the retired
+4.3 CLI transport fail with a target mismatch; completed receipts remain
+accepted. Deploying code is a separate workflow (below) and is never part of a
+data run.
 
 The staged DB passes SQLite integrity checks, uses DELETE journal mode, and is
 uploaded to a unique temporary name. A downloaded copy must match its SHA-256
 before installation. The original main DB set is renamed to retained remote
-backups; old WAL/SHM cannot attach to the new DB. Because the CLI has no rename,
-each logical move requires a stopped instance and an absent destination, pulls
-the source into a fresh private directory, hashes and fsyncs it, uploads that
-single file, then freshly pulls and verifies both destination and unchanged
-source before removing only the source. An exact missing-file probe confirms
-removal. The official server writes a `.ph-upload` temporary file and atomically
-publishes the completed PUT, so a partially uploaded DB is never published.
-Retained `.original` and `.rejected` copies cannot be move sources or deleted.
-Only canonical DB files and unique `.upload`/`.restore` staging files can be
-removed by a verified move. All listings probe exact canonical or receipt-derived
-filenames through the official HTTPS file metadata endpoint. CLI 4.3 mislabels
-missing dotted filenames as instance/auth failures. The adapter therefore reads
-the original HTTP status and exact missing-path message, and rejects truncated
-metadata. Authorization stays on the initial request only during redirects.
-Directory uploads, recursive operations and deployment are never used.
-Another download/hash check verifies installation. Only then are
-the old generation checkpointed, fresh intent published and fresh progress
-checkpointed, using the API writer's durable primitives. `auxiliary.db` and all
-other files are untouched. This path never constructs a record API client or
-authenticates with PocketBase superuser credentials. A scoped platform token
-authorizes file metadata and CLI operations. `/api/health` needs no credential.
+backups; old WAL/SHM cannot attach to the new DB. Retained `.original` and
+`.rejected` copies cannot be move sources or deleted. Only canonical DB files
+and unique `.upload`/`.restore` staging files can be created. Every file read
+first confirms a stopped instance and a fresh directory listing. Another
+download/hash check verifies installation. Only then are the old generation
+checkpointed, fresh intent published and fresh progress checkpointed, using the
+API writer's durable primitives. `auxiliary.db` and all other files are
+untouched. This path never constructs a record API client or authenticates with
+PocketBase superuser credentials. `/api/health` needs no credential.
+
+### Deploying code
+
+`.github/workflows/deploy.yml` ships `pb_hooks`, `pb_public` and `pb_migrations`
+with the v5 CLI and a `pbt_` token from the `POCKETHOST_TOKEN` secret. The CLI
+always excludes `pb_data`, and `deploy-code.py` reasserts that in the staged
+manifest before publishing. A failed publish is reported as uncertain rather
+than retried: the remote may already have the files.
 
 `writes.json.offline.json` records the exact old/fresh plans and installation
 state for crash reconciliation. Per-run captures, original DB sets, staged DBs,
@@ -114,10 +116,10 @@ run directories use 0700. No backup is deleted. Keep these artifacts private and
 retain them until the operator explicitly chooses a retention policy.
 
 Read, hash or checkpoint failures trigger restoration of the original DB set and
-journal cursor, then restart/health verification. Failed mutating CLI commands
+journal cursor, then restart/health verification. Failed mutating transport commands
 record `uncertain` and stop automatic work: the server may still be writing, so
 no conflicting rollback or restart is attempted. A tiny credential-free
-`writes.json.cli-mutation.json` marker is fsynced before every mutation and cleared
+`writes.json.sftp-mutation.json` marker is fsynced before every mutation and cleared
 only after successful acknowledgment. A process killed during a command therefore
 also requires operator reconciliation, including in a fresh process. Lost
 responses leave the retained original copies available for that reconciliation.

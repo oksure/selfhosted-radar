@@ -32,10 +32,12 @@ jobs:
         with:
           node-version: '24'
       - name: Install official CLI
-        run: npm install --global pockethost@4.3.0
+        run: npm install --global pockethost@5.0.0-alpha.9
       - name: Test deployment guard
         run: sudo env PATH="$PATH" unshare --net python3 -B -m unittest discover -s .github/deploy -p 'test_*.py' -v
       - name: Deploy code folders
         env:
           POCKETHOST_TOKEN: ${{ secrets.POCKETHOST_TOKEN }}
+          PH_EMAIL: ${{ secrets.PH_EMAIL }}
+          PH_PASSWORD: ${{ secrets.PH_PASSWORD }}
         run: python3 .github/deploy/deploy-code.py "${{ matrix.instance }}" "."

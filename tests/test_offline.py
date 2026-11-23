@@ -275,7 +275,7 @@ def test_unstable_capture_stops_after_three_attempts_without_installing(setup):
 def test_sigterm_during_capture_does_not_retry_or_publish(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'CLITransport', lambda: remote)
+  monkeypatch.setattr(O, 'SFTPTransport', lambda: remote)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   def terminate(kind, *args):
@@ -414,7 +414,7 @@ def test_journal_lock_excludes_capture_and_downtime(setup):
 def test_sigterm_during_install_rolls_back_restarts_and_exits_failure(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'CLITransport', lambda: remote)
+  monkeypatch.setattr(O, 'SFTPTransport', lambda: remote)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   sent = []
@@ -442,7 +442,7 @@ def test_runners_preserve_daily_weekly_scope():
 def test_sigterm_at_startup_retries_start_without_rolling_back(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'CLITransport', lambda: remote)
+  monkeypatch.setattr(O, 'SFTPTransport', lambda: remote)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   sent = []
@@ -471,24 +471,22 @@ def test_health_uses_existing_pockethost_user_agent(monkeypatch):
     assert timeout == 20
     return Response(b'{"code":200}')
   monkeypatch.setattr(O.urllib.request, 'urlopen', urlopen)
-  monkeypatch.setenv('POCKETHOST_TOKEN', 'synthetic-token')
-  monkeypatch.setattr(O.shutil, 'which', lambda name: '/synthetic/pockethost')
-  assert O.CLITransport().health()
+  monkeypatch.setenv('POCKETHOST_SFTP_USER', 'fixture')
+  assert O.SFTPTransport().health()
 
 
-def test_default_destination_uses_cli_without_sftp_fallback(setup, monkeypatch, capsys):
+def test_default_destination_uses_the_phost_sftp_transport(setup, monkeypatch, capsys):
   db, state, remote = setup
   destinations = []
   def transport():
-    destinations.append('official-cli')
+    destinations.append('phost-sftp')
     return remote
-  monkeypatch.delenv('SELFHOSTED_SFTP_HOST', raising=False)
-  monkeypatch.setenv('PH_EMAIL', 'fixture@example.invalid')
-  monkeypatch.setattr(O, 'CLITransport', transport)
+  monkeypatch.setenv('POCKETHOST_SFTP_USER', 'fixture')
+  monkeypatch.setattr(O, 'SFTPTransport', transport)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   assert O.main(['--state-file', str(state)]) == 0
-  assert destinations == ['official-cli']
+  assert destinations == ['phost-sftp']
   assert json.loads(capsys.readouterr().out)['success']
 
 
