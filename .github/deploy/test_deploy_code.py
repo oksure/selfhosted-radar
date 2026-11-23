@@ -69,9 +69,11 @@ class DeploymentTests(unittest.TestCase):
     if argv[1] == "deploy" and "--out" in argv:
       self.events.append("stage")
       stage = Path(argv[argv.index("--out") + 1])
-      stage.mkdir(parents=True)
+      # Mirror the real CLI: only files present in the source reach the stage.
+      stage.mkdir(parents=True, exist_ok=True)
       for folder in deploy_code.ROOTS:
-        shutil.copytree(kwargs["cwd"] / folder, stage / folder)
+        shutil.copytree(kwargs["cwd"] / folder, stage / folder,
+                        ignore=shutil.ignore_patterns(".gitkeep"))
       return subprocess.CompletedProcess(argv, 0, "Wrote files\n", "")
     if argv[1] == "deploy":
       self.events.append("publish")
@@ -118,7 +120,8 @@ class DeploymentTests(unittest.TestCase):
     return response
 
   def deploy(self, instance="fixture", source=None):
-    (self.source / "pb_public/index.html").write_text("original")
+    if not getattr(self, "empty_source", False):
+      (self.source / "pb_public/index.html").write_text("original")
     self.stage = None
     real_run = self.run_process
     def run(argv, **kwargs):
@@ -173,6 +176,18 @@ class DeploymentTests(unittest.TestCase):
     # The point is that an empty folder no longer aborts staging.
     self.assertIn("check", self.events)
     self.assertIn("publish", self.events)
+
+  def test_empty_manifest_never_wakes_a_stopped_instance(self):
+    self.state = False
+    for folder in deploy_code.ROOTS:
+      shutil.rmtree(self.source / folder)
+      (self.source / folder).mkdir()
+      (self.source / folder / ".gitkeep").write_text("")
+    self.empty_source = True
+    self.deploy()
+    self.assertNotIn("power:on", self.events)
+    self.assertNotIn("publish", self.events)
+    self.assertFalse(self.state)
 
   def test_missing_folder_and_symlink_fail(self):
     shutil.rmtree(self.source / "pb_hooks")

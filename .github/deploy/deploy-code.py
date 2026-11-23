@@ -66,6 +66,8 @@ def manifest(root):
     if p.is_file():
       if not code_path(name):
         raise DeployError("Stage contains a file outside the three code folders")
+      if name.endswith("/.gitkeep"):
+        continue  # Directory placeholder; there is nothing to publish.
       files[name] = hashlib.sha256(p.read_bytes()).hexdigest()
     elif name not in ROOTS and not code_path(name):
       raise DeployError("Stage contains an unexpected directory")
@@ -262,11 +264,18 @@ def deploy(instance, source):
     files = manifest(stage)
     if any(path.startswith(("pb_data", "pb_cache")) for path in files):
       raise DeployError("The deploy set must never contain pb_data or pb_cache")
+    if not files:
+      # Nothing to publish: never wake a stopped instance for an empty set.
+      print(f"Nothing to deploy to {instance}; the code folders are empty")
+      return
     original = power(instance)
     # v5 refuses to publish to a stopped instance (4.3 accepted it). Wake it
     # just for the publication, then restore the recorded state below. The
     # scope check is an HTTP call, so the app must finish starting first.
+    # Waking needs phost; a runner without it cannot deploy a stopped instance.
     if original is False:
+      if shutil.which("phost") is None:
+        raise DeployError(f"{instance} is powered off and phost is unavailable to wake it")
       restore_power(instance, True)
       health(instance)
     check(instance, token, files)
