@@ -32,7 +32,18 @@ jobs:
         with:
           node-version: '24'
       - name: Install official CLI
-        run: npm install --global pockethost@5.0.0-alpha.9
+        env:
+          POCKETHOST_VERSION: 5.0.0-alpha.10
+        run: |
+          set -euo pipefail
+          asset="pockethost_${POCKETHOST_VERSION}_linux_amd64.zip"
+          base="https://github.com/pockethost/pockethost/releases/download/v${POCKETHOST_VERSION}"
+          curl -sSLo "$RUNNER_TEMP/$asset" "$base/$asset"
+          curl -sSLo "$RUNNER_TEMP/checksums.txt" "$base/checksums.txt"
+          (cd "$RUNNER_TEMP" && grep " ${asset}\$" checksums.txt | sha256sum -c -)
+          unzip -o -q "$RUNNER_TEMP/$asset" -d "$RUNNER_TEMP/phcli"
+          install -m 0755 "$RUNNER_TEMP/phcli/pockethost" /usr/local/bin/pockethost
+          pockethost version
       - name: Test deployment guard
         run: sudo env PATH="$PATH" unshare --net python3 -B -m unittest discover -s .github/deploy -p 'test_*.py' -v
       - name: Deploy code folders

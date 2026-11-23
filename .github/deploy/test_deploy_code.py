@@ -241,10 +241,14 @@ class DeploymentTests(unittest.TestCase):
 
   def test_workflow_contract(self):
     text = Path(__file__).parents[1].joinpath("workflows/deploy.yml").read_text()
-    for fragment in ("node-version: '24'", "pockethost@5.0.0-alpha.9", "max-parallel: 1",
+    for fragment in ("node-version: '24'", "POCKETHOST_VERSION: 5.0.0-alpha.10",
+                     "releases/download/v${POCKETHOST_VERSION}", "sha256sum -c -",
+                     "max-parallel: 1",
                      "group: pockethost-${{ matrix.instance }}", "cancel-in-progress: false",
                      "POCKETHOST_TOKEN: ${{ secrets.POCKETHOST_TOKEN }}", "'.github/deploy/**'"):
       self.assertIn(fragment, text)
+    # v5 ships as release binaries only; the pre-releases are not on npm.
+    self.assertNotIn("npm install", text)
     self.assertNotIn("SFTP", text)
     self.assertNotIn("lftp", text)
     expected = "selfhosted" if Path(__file__).parents[2].name == "selfhosted-radar" else "bible, console, gloria, sitefb, taskq"

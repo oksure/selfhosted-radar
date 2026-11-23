@@ -1,6 +1,9 @@
 # CI code deployment
 
-CI uses Node 24 and the official `pockethost@4.3.0` CLI. Configure the repository's
+CI uses the official `pockethost` v5 CLI (`5.0.0-alpha.10`), installed from its
+GitHub release after a SHA-256 check against that release's `checksums.txt`.
+The v5 pre-releases are not published to npm, so the workflow never installs
+from the registry. Configure the repository's
 `POCKETHOST_TOKEN` Actions secret with the existing common all-instances read/write
 token. No new token or SSH credentials are needed. Instances deploy serially;
 the per-instance concurrency group queues deployments without cancelling them.
