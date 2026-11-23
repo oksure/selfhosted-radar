@@ -249,7 +249,10 @@ class DeploymentTests(unittest.TestCase):
     self.assertFalse(self.state)
     self.assertLess(self.events.index("power:on"), self.events.index("publish"))
     self.assertLess(self.events.index("publish"), self.events.index("power:off"))
-    self.assertNotIn("health", self.events)
+    # Wake it, confirm the app answers, then check scope before publishing.
+    self.assertLess(self.events.index("power:on"), self.events.index("health"))
+    self.assertLess(self.events.index("health"), self.events.index("check"))
+    self.assertLess(self.events.index("check"), self.events.index("publish"))
 
   def test_on_instance_is_probed_after_publish_without_power_changes(self):
     self.deploy()

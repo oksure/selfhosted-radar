@@ -264,9 +264,11 @@ def deploy(instance, source):
       raise DeployError("The deploy set must never contain pb_data or pb_cache")
     original = power(instance)
     # v5 refuses to publish to a stopped instance (4.3 accepted it). Wake it
-    # just for the publication, then restore the recorded state below.
+    # just for the publication, then restore the recorded state below. The
+    # scope check is an HTTP call, so the app must finish starting first.
     if original is False:
       restore_power(instance, True)
+      health(instance)
     check(instance, token, files)
     if manifest(stage) != files:
       raise DeployError("Stage changed after the scope check")
