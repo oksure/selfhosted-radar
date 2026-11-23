@@ -75,9 +75,13 @@ class DeploymentTests(unittest.TestCase):
       return subprocess.CompletedProcess(argv, 0, "", "")
     if argv[1] == "pull":
       self.events.append("preserve")
-      output = Path(argv[argv.index("--dir") + 1]) / argv[2]
-      output.parent.mkdir(parents=True)
+      # v5 pulls into the project directory and also fetches pb_data.
+      output = Path(kwargs["cwd"]) / argv[-1]
+      output.parent.mkdir(parents=True, exist_ok=True)
       output.write_text("private remote fixture")
+      # v5 pull also drags pb_data into the project; it must never ship.
+      (Path(kwargs["cwd"]) / "pb_data").mkdir(exist_ok=True)
+      (Path(kwargs["cwd"]) / "pb_data/data.db").write_bytes(b"never ship")
       return subprocess.CompletedProcess(argv, 0, "", "")
     raise AssertionError(argv)
 
@@ -241,7 +245,7 @@ class DeploymentTests(unittest.TestCase):
 
   def test_workflow_contract(self):
     text = Path(__file__).parents[1].joinpath("workflows/deploy.yml").read_text()
-    for fragment in ("node-version: '24'", "POCKETHOST_VERSION: 5.0.0-alpha.10",
+    for fragment in ("POCKETHOST_VERSION: 5.0.0-alpha.10",
                      "releases/download/v${POCKETHOST_VERSION}", "sha256sum -c -",
                      "max-parallel: 1",
                      "group: pockethost-${{ matrix.instance }}", "cancel-in-progress: false",

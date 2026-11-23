@@ -50,10 +50,17 @@ def code_path(value):
                   for p in parts))
 
 
+# CLI project state that the tool writes next to the code; never deployed.
+PROJECT_STATE = (".pocketbase", ".pocketone", ".pockethostconfig", ".git",
+                 "node_modules", "pb_data", "pb_cache")
+
+
 def manifest(root):
   files = {}
   for p in sorted(root.rglob("*")):
     name = p.relative_to(root).as_posix()
+    if name.split("/")[0] in PROJECT_STATE and not name.startswith(("pb_data/", "pb_cache/")):
+      continue
     if p.is_symlink() or not (p.is_dir() or p.is_file()):
       raise DeployError("Stage contains a link or special file")
     if p.is_file():
@@ -83,9 +90,12 @@ def cli(args, cwd, env, publishing=False):
 
 
 def environment(token):
+  # PATH stays: subprocess resolves `pockethost` through it, and without it the
+  # spawn fails before the CLI runs. No proxy variable is forwarded, so the
+  # bearer token never travels through an environment-selected proxy.
   env = {k: v for k, v in os.environ.items()
          if not k.startswith(("POCKETHOST_", "P1_", "PHIO_"))
-         and not k.lower().endswith("_proxy") and k not in ("NODE_OPTIONS", "PATH")}
+         and not k.lower().endswith("_proxy") and k != "NODE_OPTIONS"}
   env.update(P1_TOKEN=token, POCKETHOST_TOKEN=token)
   return env
 
@@ -210,31 +220,49 @@ def deploy(instance, source):
     env = dict(environment(token), POCKETHOST_HOME=str(Path(tmp) / "cli-home"))
     # --out is local only; the CLI, not a parallel glob, determines the exact set.
     # v5 always excludes pb_data, so the main database cannot be shipped.
-    cli(["deploy", "--out", str(Path(tmp) / "stage"), "--no-node-modules",
-         "--include", *INCLUDES], snapshot, env)
+    # v5 takes one value per --include; repeating the flag is the supported form.
+    includes = [flag for pattern in INCLUDES for flag in ("--include", pattern)]
+    cli(["deploy", "--out", str(Path(tmp) / "stage"), "--no-node-modules", *includes],
+        snapshot, env)
     stage = Path(tmp) / "stage"
     for name in ROOTS:
       (stage / name).mkdir(exist_ok=True)
     for name in PRESERVED.get(instance, ()):
       if not code_path(name) or (stage / name).exists():
         raise DeployError("Private remote file conflicts with repository ownership")
-      destination = Path(tmp) / "preserved"
-      cli(["pull", name, "--dir", str(destination), "--instance", instance], stage, env)
-      original = destination / name
-      if original.is_symlink() or not original.is_file():
+      # v5 records remotes per project and its pull also fetches pb_data, so
+      # read into a throwaway project, copy only the named file, then discard it.
+      scratch = Path(tmp) / "preserved"
+      scratch.mkdir()
+      link(instance, scratch, env)
+      cli(["pull", "deploy", name], scratch, env)
+      pulled = scratch / name
+      if pulled.is_symlink() or not pulled.is_file():
         raise DeployError("Private remote file was not retrieved")
-      shutil.copyfile(original, stage / name)
-    files = manifest(stage)
-    if any(path.startswith("pb_data/") for path in files):
-      raise DeployError("The deploy set must never contain pb_data")
-    original = power(instance)
+      shutil.copyfile(pulled, stage / name)
+      shutil.rmtree(scratch, ignore_errors=True)
+    # v5 writes project metadata next to the code; nothing outside the three
+    # code folders may reach the manifest, so drop provider state and databases.
+    # Remotes are recorded per project, so sign in against the project that
+    # publishes. link itself scaffolds pb_data/tsconfig/types, which are removed
+    # right after so nothing outside the three code folders reaches the manifest.
     link(instance, stage, env)
+    # .pocketbase holds the remote record the publish needs; the manifest skips
+    # project state, so it stays while nothing leaves the three code folders.
+    for name in ("pb_data", "pb_cache", ".pocketone", "node_modules"):
+      shutil.rmtree(stage / name, ignore_errors=True)
+    for name in (".pockethostconfig", "pocketone.yaml", "tsconfig.json", "types.d.ts"):
+      (stage / name).unlink(missing_ok=True)
+    files = manifest(stage)
+    if any(path.startswith(("pb_data", "pb_cache")) for path in files):
+      raise DeployError("The deploy set must never contain pb_data or pb_cache")
+    original = power(instance)
     check(instance, token, files)
     if manifest(stage) != files:
       raise DeployError("Stage changed after the scope check")
     known_outcome = True
     try:
-      cli(["deploy", "deploy", "--no-node-modules", "--include", *INCLUDES],
+      cli(["deploy", "deploy", "--no-node-modules", *includes],
           stage, env, publishing=True)
     except (UncertainDeploy, KeyboardInterrupt, SystemExit):
       known_outcome = False
