@@ -60,6 +60,10 @@ class DeploymentTests(unittest.TestCase):
       return subprocess.CompletedProcess(argv, 0, "Linked\n", "")
     if argv[1] == "deploy" and "--out" in argv:
       self.events.append("stage")
+      # v5 accepts one value per --include; the flag must repeat, never collect
+      # several patterns behind one occurrence.
+      values = [argv[i + 1] for i, a in enumerate(argv) if a == "--include"]
+      self.assertEqual(values, list(deploy_code.INCLUDES))
       stage = Path(argv[argv.index("--out") + 1])
       stage.mkdir(parents=True)
       for folder in deploy_code.ROOTS:
@@ -255,7 +259,8 @@ class DeploymentTests(unittest.TestCase):
 
   def test_workflow_contract(self):
     text = Path(__file__).parents[1].joinpath("workflows/deploy.yml").read_text()
-    for fragment in ("POCKETHOST_VERSION: 5.0.0-alpha.10",
+    for fragment in ("node-version: '24'",
+                     "POCKETHOST_VERSION: 5.0.0-alpha.10",
                      "releases/download/v${POCKETHOST_VERSION}", "sha256sum -c -",
                      "max-parallel: 1",
                      "group: pockethost-${{ matrix.instance }}", "cancel-in-progress: false",

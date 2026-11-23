@@ -13,9 +13,9 @@ Run locally (this publishes changes):
 The source must contain real directories named `pb_public`, `pb_hooks`, and
 `pb_migrations`. CI supplies the appropriate source and instance.
 
-The helper copies the three folders to a private snapshot and anchors both CLI
-working directories with a private `.pockethostconfig`, explicit
-`POCKETHOST_PROJECT_DIR` and `INIT_CWD`. It never writes a config to the repository.
+The helper copies the three folders to a private snapshot and runs each CLI
+command inside a private directory under `POCKETHOST_HOME`. It never writes a
+config to the repository.
 It stages the official CLI's exact local deployment set with
 `--out --no-node-modules`, passing one pattern per repeated `--include` flag
 (v5 rejects several values behind one flag). It rejects symlinks and files
@@ -51,7 +51,7 @@ concurrency group serializes only this repository's workflows. GitHub concurrenc
 also permits replacement of a pending run by a newer pending run.
 
 Offline checks:
-Install the official CLI 4.3.0 on PATH before running these checks. Its real
+Install the pinned official CLI before running these checks. Its real
 local-staging regression is mandatory and runs without network access.
 `netless python3 -m unittest discover -s .github/deploy -p 'test_*.py' -v`.
 These use synthetic CLI/HTTP responses and exercise no real instance.
