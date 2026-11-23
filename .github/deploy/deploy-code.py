@@ -225,8 +225,10 @@ def deploy(instance, source):
     cli(["deploy", "--out", str(Path(tmp) / "stage"), "--no-node-modules", *includes],
         snapshot, env)
     stage = Path(tmp) / "stage"
+    # v5 may write no stage at all when an instance has an empty code folder.
+    stage.mkdir(parents=True, exist_ok=True)
     for name in ROOTS:
-      (stage / name).mkdir(exist_ok=True)
+      (stage / name).mkdir(parents=True, exist_ok=True)
     for name in PRESERVED.get(instance, ()):
       if not code_path(name) or (stage / name).exists():
         raise DeployError("Private remote file conflicts with repository ownership")

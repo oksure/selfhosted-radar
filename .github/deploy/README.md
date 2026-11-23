@@ -17,23 +17,28 @@ The helper copies the three folders to a private snapshot and anchors both CLI
 working directories with a private `.pockethostconfig`, explicit
 `POCKETHOST_PROJECT_DIR` and `INIT_CWD`. It never writes a config to the repository.
 It stages the official CLI's exact local deployment set with
-`--out --no-node-modules`. It rejects symlinks and files outside the
-three folders, including files added by the CLI's broader default includes.
+`--out --no-node-modules`, passing one pattern per repeated `--include` flag
+(v5 rejects several values behind one flag). It rejects symlinks and files
+outside the three folders, including files added by the CLI's broader default
+includes.
 Provider-owned `_ph_*` hooks and `*_pockethost_*` migrations are reference-only
 and excluded from uploads and deletions.
 Empty code sets (including folders containing only ignored `.gitkeep` files)
 remain authoritative, subject to the same remote deletion guard.
 It hashes the staged files and submits a read-only deploy check. A successful
-response must contain both a `missing` hash list and an explicit `toDelete`
-list. Older servers omitting that list fail closed. Obsolete files within the
-three folders may be deleted; any other remote deletion blocks publication.
+response must contain a `missing` hash list of known staged hashes and no other
+keys; anything else fails closed.
 Resolve remote extras with a separate reviewed operation; there is no fallback.
 
-Only after this guard does the CLI deploy the same staged files with `--yes`.
+Only after this guard does the CLI deploy the same staged files. v5 records
+remotes per project, so the sign-in runs inside the staging directory and any
+private-file pull happens in a throwaway project. The CLI writes project state
+and databases next to the code, which is removed before hashing so nothing
+outside the three folders reaches the deploy set.
 Installed packages remain unmanaged through `--no-node-modules`. The helper
-never includes database files. Original power is read through `show --json`
-and restored after an acknowledged publish result. An unknown CLI outcome stops
-without an automatic power change. Health checks are
+never includes database files. Original power is read through `phost` when that
+helper exists and restored after an acknowledged publish result. An unknown CLI
+outcome stops without an automatic power change. Health checks are
 bounded and run only when the instance was originally powered on. A CLI startup
 failure message fails deployment even when its exit status is zero.
 

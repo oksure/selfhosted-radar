@@ -156,6 +156,16 @@ class DeploymentTests(unittest.TestCase):
         self.deploy()
     self.assertNotIn("check", self.events)
 
+  def test_empty_code_folder_still_deploys(self):
+    # v5 writes no stage entry for a folder with no files; the stage must
+    # still exist so the remaining folders and the scope check can run.
+    shutil.rmtree(self.source / "pb_public")
+    (self.source / "pb_public").mkdir()
+    self.deploy()
+    # The point is that an empty folder no longer aborts staging.
+    self.assertIn("check", self.events)
+    self.assertIn("publish", self.events)
+
   def test_missing_folder_and_symlink_fail(self):
     shutil.rmtree(self.source / "pb_hooks")
     with self.assertRaises(deploy_code.DeployError):
