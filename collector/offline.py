@@ -57,6 +57,8 @@ class SFTPTransport:
   def __init__(self, host=None, remote_dir='selfhosted/pb_data'):
     user = (os.environ.get('POCKETHOST_SFTP_USER') or os.environ.get('PH_EMAIL')
             or os.environ.get('ICLOUD_EMAIL') or '')
+    # PH_EMAIL is a full address ("name@example.com"); SFTP wants the local part.
+    user = user.strip().partition('@')[0]
     host = host or (user + '@ftp.pockethost.io')
     if (not re.fullmatch(r'[A-Za-z0-9_.+%-]+@ftp\.pockethost\.io', host)
         or host.startswith('-')):

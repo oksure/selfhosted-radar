@@ -149,10 +149,14 @@ def test_constructor_accepts_configured_user(monkeypatch, user):
   assert transport.remote_dir == REMOTE
 
 
-def test_constructor_falls_back_to_ph_email(monkeypatch):
+@pytest.mark.parametrize('configured,expected', [
+  ('owner', 'owner@ftp.pockethost.io'),
+  ('owner@example.com', 'owner@ftp.pockethost.io'),
+])
+def test_constructor_falls_back_to_ph_email_local_part(monkeypatch, configured, expected):
   monkeypatch.delenv('POCKETHOST_SFTP_USER', raising=False)
-  monkeypatch.setenv('PH_EMAIL', 'owner')
-  assert O.SFTPTransport().host == 'owner@ftp.pockethost.io'
+  monkeypatch.setenv('PH_EMAIL', configured)
+  assert O.SFTPTransport().host == expected
 
 
 def test_constructor_rejects_other_remote_dirs(monkeypatch):
