@@ -77,6 +77,9 @@ class BackupAPITransport:
           or not access or s3.get('accessKey') != access):
         raise RuntimeError('unexpected backup S3 settings require operator review')
       self.r2_active = True
+    elif isinstance(s3, dict) and any(s3.get(field) for field in (
+        'endpoint', 'region', 'bucket', 'accessKey', 'secret', 'forcePathStyle')):
+      raise RuntimeError('inactive backup S3 settings are nonempty; operator review required')
 
   def _mark(self, operation, action):
     if self.uncertain:
@@ -252,8 +255,9 @@ class BackupAPITransport:
                lambda: self.api._req('PATCH', '/api/settings', {'backups': {'s3': empty}}))
     settings = self.api._req('GET', '/api/settings')['backups']['s3']
     if ('secret' not in settings or settings.get('secret') or settings.get('enabled')
-        or settings.get('accessKey') or settings.get('endpoint') or settings.get('bucket')):
-      raise APIError('temporary R2 credentials could not be verified cleared')
+        or any(settings.get(field) for field in (
+          'accessKey', 'endpoint', 'region', 'bucket', 'forcePathStyle'))):
+      raise APIError('temporary R2 settings could not be verified cleared')
     self.r2_active = False
 
   def upload_backup(self, path, filename):

@@ -329,6 +329,17 @@ def test_confirmed_400_rollback_recovers_after_health_returns_later(tmp_path):
   assert json.loads(O._receipt_path(state).read_text())['phase'] == 'complete'
 
 
+def test_configure_rejects_secret_left_in_disabled_r2_settings(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.settings['backups']['s3']['secret'] = 'fixture-secret'
+  with pytest.raises(RuntimeError, match='inactive backup S3 settings are nonempty'):
+    transport.configure(tmp_path / 'state.json')
+  assert not transport.r2_active
+
+
 def test_temporary_r2_settings_are_journaled_and_cleared(monkeypatch, tmp_path):
   db = tmp_path / 'seed.db'
   make_db(db, 'stable')
