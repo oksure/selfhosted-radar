@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +16,7 @@ from . import pbwrite as W
 from .offline import MutationUncertain
 
 MAX_UPLOAD = 90 * 1024 * 1024
+BACKUP_CREATE_RETRY_DELAY = 120
 R2_ENDPOINT = 'https://4d0bb8ab7e61809c181b815854ecd8d8.r2.cloudflarestorage.com'
 R2_BUCKET = 'pb-backup-stage'
 INSTANCE_IDS = {'selfhosted': '2sb1xkspblek1f5', 'bkptest': '5kvbuh7ntjbz6la'}
@@ -70,16 +72,23 @@ class BackupAPITransport:
     if self.uncertain:
       raise MutationUncertain('unfinished PocketBase mutation requires operator reconciliation')
     settings = self.api._req('GET', '/api/settings')
-    s3 = (settings.get('backups') or {}).get('s3') if isinstance(settings, dict) else None
-    if isinstance(s3, dict) and s3.get('enabled'):
+    backups = settings.get('backups') if isinstance(settings, dict) else None
+    s3 = backups.get('s3') if isinstance(backups, dict) else None
+    if not isinstance(s3, dict) or 'enabled' not in s3:
+      raise RuntimeError('backup S3 settings could not be inspected; operator review required')
+    if s3['enabled'] is True:
       access = os.environ.get('CLOUDFLARE_R2_ACCESS', '')
       if (s3.get('endpoint') != R2_ENDPOINT or s3.get('bucket') != R2_BUCKET
           or not access or s3.get('accessKey') != access):
         raise RuntimeError('unexpected backup S3 settings require operator review')
       self.r2_active = True
-    elif isinstance(s3, dict) and any(s3.get(field) for field in (
-        'endpoint', 'region', 'bucket', 'accessKey', 'secret', 'forcePathStyle')):
-      raise RuntimeError('inactive backup S3 settings are nonempty; operator review required')
+    elif s3['enabled'] is False:
+      empty = {'enabled': False, 'endpoint': '', 'region': '', 'bucket': '',
+               'accessKey': '', 'secret': '', 'forcePathStyle': False}
+      if s3 != empty:
+        raise RuntimeError('inactive backup S3 settings are nonempty or unverifiable; operator review required')
+    else:
+      raise RuntimeError('backup S3 enabled state could not be inspected; operator review required')
 
   def _mark(self, operation, action):
     if self.uncertain:
@@ -132,8 +141,26 @@ class BackupAPITransport:
     key = self._key(key)
     if key in self._keys():
       raise RuntimeError('refusing to overwrite a retained remote backup')
-    self._mark('create-backup:' + key,
-               lambda: self.api._req('POST', '/api/backups', {'name': key}))
+    create = lambda: self._mark(
+      'create-backup:' + key,
+      lambda: self.api._req('POST', '/api/backups', {'name': key}))
+    try:
+      create()
+    except W.PBError as exc:
+      if exc.status != 400:
+        raise
+      if key in self._keys():
+        return key
+      # A restore can make /api/health ready before the backup manager accepts POST.
+      time.sleep(BACKUP_CREATE_RETRY_DELAY)
+      if key in self._keys():
+        return key
+      try:
+        create()
+      except W.PBError as retry_exc:
+        if retry_exc.status != 400 or key not in self._keys():
+          raise
+        return key
     if key not in self._keys():
       raise APIError('created backup was not confirmed remotely')
     return key
@@ -253,10 +280,10 @@ class BackupAPITransport:
              'accessKey': '', 'secret': '', 'forcePathStyle': False}
     self._mark('clear-temporary-r2',
                lambda: self.api._req('PATCH', '/api/settings', {'backups': {'s3': empty}}))
-    settings = self.api._req('GET', '/api/settings')['backups']['s3']
-    if ('secret' not in settings or settings.get('secret') or settings.get('enabled')
-        or any(settings.get(field) for field in (
-          'accessKey', 'endpoint', 'region', 'bucket', 'forcePathStyle'))):
+    response = self.api._req('GET', '/api/settings')
+    backups = response.get('backups') if isinstance(response, dict) else None
+    settings = backups.get('s3') if isinstance(backups, dict) else None
+    if not isinstance(settings, dict) or settings != empty:
       raise APIError('temporary R2 settings could not be verified cleared')
     self.r2_active = False
 

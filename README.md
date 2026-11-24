@@ -83,9 +83,11 @@ SHA-256 must match before `POST /api/backups/{key}/restore`. Larger ZIPs use the
 `pb-backup-stage` R2 bucket: the original and staged backups are copied directly
 to R2 and read back for hash verification. R2 credentials are placed in the
 instance's backup settings only for that transfer and are cleared and verified
-empty afterward. Existing nonempty S3 settings are never overwritten. R2
-credentials, file tokens and superuser tokens are not written to receipts or
-logs.
+empty afterward. Existing nonempty S3 settings are never overwritten. Missing
+or unreadable S3 settings, a missing/non-boolean `enabled` field, or an omitted
+`secret` field are not treated as disabled/empty; cleanup remains unverified and
+the next collection stops for operator reconciliation. R2 credentials, file
+tokens and superuser tokens are not written to receipts or logs.
 
 Restore restarts the PocketBase app itself; the collector never powers the
 instance off or on. It waits for `/api/health` to return 200, then takes a fresh
@@ -121,8 +123,11 @@ the retained original backup and a health check before the old journal cursor is
 restored. A mutation with an unconfirmed outcome is fenced: the credential-free
 `writes.json.backup-mutation.json` marker remains pending, and no conflicting
 restore or retry is attempted until operator reconciliation. Process termination
-inside a mutation follows the same path. During rollback, a confirmed HTTP 400 may
-be retried once after health returns; recovery verifies the original logical DB.
+inside a mutation follows the same path. A confirmed HTTP 400 while creating a
+backup triggers a remote-key check and one retry after 120 seconds. The key is
+checked after each rejection; if present, subsequent download and hash checks
+must still pass. This covers backup readiness lag after restore. Recovery
+verifies the original logical DB.
 A later invocation verifies the logical dump before publishing progress; if it
 differs from the staged DB, recovery restores the retained original backup. After a checkpointed installation,
 startup failure keeps the installed contents and progress; recovery checks health

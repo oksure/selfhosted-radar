@@ -40,11 +40,15 @@ class FakeAPI:
     self.calls = []
     self.token = 'fixture-bearer'
     self.settings = {'backups': {'s3': {'enabled': False, 'endpoint': '', 'region': '',
-                                       'bucket': '', 'accessKey': '', 'forcePathStyle': False}}}
+                                       'bucket': '', 'accessKey': '', 'secret': '',
+                                       'forcePathStyle': False}}}
     self.transport = None
     self.fail = None
+    self.create_400_count = 0
+    self.create_400_after_write_count = 0
     self.retain_secret = False
     self.omit_secret_on_get = False
+    self.omit_enabled_on_get = False
   def _req(self, method, path, body=None, params=None):
     self.calls.append((method, path))
     if method == 'POST':
@@ -52,9 +56,12 @@ class FakeAPI:
       marker = json.loads(self.transport._marker.read_text())
       assert marker['pending'] is True
     if path == '/api/settings' and method == 'GET':
-      if self.omit_secret_on_get:
+      if self.omit_secret_on_get or self.omit_enabled_on_get:
         settings = json.loads(json.dumps(self.settings))
-        settings['backups']['s3'].pop('secret', None)
+        if self.omit_secret_on_get:
+          settings['backups']['s3'].pop('secret', None)
+        if self.omit_enabled_on_get:
+          settings['backups']['s3'].pop('enabled', None)
         return settings
       return self.settings
     if path == '/api/settings' and method == 'PATCH':
@@ -66,7 +73,14 @@ class FakeAPI:
     if path == '/api/backups' and method == 'GET':
       return [{'key': key} for key in self.archives]
     if path == '/api/backups' and method == 'POST':
+      if self.create_400_count:
+        self.create_400_count -= 1
+        raise P.W.PBError(400, {})
       key = body['name']
+      if self.create_400_after_write_count:
+        self.create_400_after_write_count -= 1
+        self.archives[key] = self.seed
+        raise P.W.PBError(400, {})
       self.archives[key] = self.seed
       return None
     if path == '/api/files/token':
@@ -151,6 +165,61 @@ def test_rollback_retryability_tracks_confirmed_restore_rejection(monkeypatch, t
   api.fail = None
   transport.restore(key)
   assert not transport.rollback_retryable(key)
+
+
+def test_create_backup_retries_confirmed_400_once(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.create_400_count = 1
+  delays = []
+  monkeypatch.setattr(P.time, 'sleep', delays.append)
+  key = 'radar-fixture-rollback-check.zip'
+
+  assert transport.create_backup(key) == key
+  assert key in api.archives
+  assert delays == [P.BACKUP_CREATE_RETRY_DELAY]
+  assert len([1 for method, path in api.calls if method == 'POST' and path == '/api/backups']) == 2
+  marker = json.loads(transport._marker.read_text())
+  assert marker['pending'] is False and 'response_status' not in marker
+
+
+def test_create_backup_resolves_retry_400_when_key_appears(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.create_400_count = 1
+  api.create_400_after_write_count = 1
+  delays = []
+  monkeypatch.setattr(P.time, 'sleep', delays.append)
+  key = 'radar-fixture-rollback-check.zip'
+
+  assert transport.create_backup(key) == key
+  assert key in api.archives
+  assert delays == [P.BACKUP_CREATE_RETRY_DELAY]
+  assert len([1 for method, path in api.calls if method == 'POST' and path == '/api/backups']) == 2
+  marker = json.loads(transport._marker.read_text())
+  assert marker['pending'] is False and marker['response_status'] == 400
+
+
+def test_create_backup_stops_after_second_confirmed_400(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.create_400_count = 2
+  delays = []
+  monkeypatch.setattr(P.time, 'sleep', delays.append)
+  key = 'radar-fixture-rollback-check.zip'
+
+  with pytest.raises(P.W.PBError):
+    transport.create_backup(key)
+  assert key not in api.archives
+  assert delays == [P.BACKUP_CREATE_RETRY_DELAY]
+  marker = json.loads(transport._marker.read_text())
+  assert marker['pending'] is False and marker['response_status'] == 400
 
 
 def test_mutation_marker_blocks_after_unconfirmed_upload(monkeypatch, tmp_path):
@@ -338,6 +407,52 @@ def test_configure_rejects_secret_left_in_disabled_r2_settings(monkeypatch, tmp_
   with pytest.raises(RuntimeError, match='inactive backup S3 settings are nonempty'):
     transport.configure(tmp_path / 'state.json')
   assert not transport.r2_active
+
+
+def test_configure_rejects_unreadable_secret_in_disabled_r2_settings(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.omit_secret_on_get = True
+
+  with pytest.raises(RuntimeError, match='unverifiable'):
+    transport.configure(tmp_path / 'state.json')
+  assert not transport.r2_active
+
+
+@pytest.mark.parametrize('settings', [
+  None, {}, {'backups': {}}, {'backups': {'s3': None}},
+  {'backups': {'s3': {'endpoint': '', 'region': '', 'bucket': '', 'accessKey': '',
+                      'secret': '', 'forcePathStyle': False}}},
+  {'backups': {'s3': {'enabled': None, 'endpoint': '', 'region': '', 'bucket': '',
+                      'accessKey': '', 'secret': '', 'forcePathStyle': False}}},
+])
+def test_configure_rejects_unreadable_s3_settings(monkeypatch, tmp_path, settings):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.settings = settings
+
+  with pytest.raises(RuntimeError, match='could not be inspected'):
+    transport.configure(tmp_path / 'state.json')
+  assert not transport.r2_active
+
+
+def test_r2_clear_rejects_missing_enabled_state(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  monkeypatch.setattr(transport, '_aws_env', lambda: {
+    'AWS_ACCESS_KEY_ID': 'fixture-access', 'AWS_SECRET_ACCESS_KEY': 'fixture-secret'})
+  transport.configure_r2()
+  api.omit_enabled_on_get = True
+
+  with pytest.raises(P.APIError, match='could not be verified cleared'):
+    transport.clear_r2()
+  assert transport.r2_active
 
 
 def test_temporary_r2_settings_are_journaled_and_cleared(monkeypatch, tmp_path):
