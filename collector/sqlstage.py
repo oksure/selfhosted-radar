@@ -1,16 +1,12 @@
-"""Stage the merged dataset directly into PocketBase's SQLite file.
+"""Apply a merged dataset to a local SQLite staging database.
 
-Bulk loads never go through the HTTP API: PocketHost caps requests per IP per
-hour, and a full run needs tens of thousands of writes. The flow is
+This module contains the SQL planning and apply logic used by the offline bulk
+publisher. The Backups API transport, retained snapshots and restore safeguards
+live in ``collector.offline`` and ``collector.pockethost_backup``; this module
+does not manage instance power or transfer ``pb_data`` files.
 
-  phost off <inst> --yes
-  sftp download pb_data/data.db
-  python3 -m collector.sqlstage data.db        (this module)
-  sftp upload pb_data/data.db     (instance still off)
-  phost on <inst>
-
-Standard record writes stay available for small, interactive updates; this is
-only for the bulk path.
+Standard record writes stay available for small, interactive updates; this SQL
+path is only for the bulk publisher.
 """
 import json
 import math

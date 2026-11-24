@@ -44,15 +44,16 @@ tests/         merge, delta and adapter tests
 ## Loading data
 
 Daily and weekly bulk runs use `collector.offline`. Sources are captured while
-the site is online. Under the API writer's existing journal lock, it stops only
-`selfhosted`, freshly downloads the stopped `data.db` and any WAL/SHM over SFTP,
-and preserves them locally. SQLite's backup API builds a separate staging DB,
-including WAL content. Pending intent is replayed with its exact saved IDs, then
-fresh requested input is planned through `SQLiteInventory` and applied through
-`apply_journal`. Neither SQL replay nor staging advances journal progress.
+the site is online. Under the API writer's journal lock, the collector creates a
+fresh PocketBase backup through the Backups API and retains the ZIP locally and
+on the instance. It integrity-checks the embedded `data.db`, then builds a
+separate SQLite staging database. Pending intent is replayed with its exact
+saved IDs, then fresh requested input is planned through `SQLiteInventory` and
+applied through `apply_journal`. Neither SQL replay nor staging advances journal
+progress.
 
 ```bash
-# phost for power, PocketHost SFTP for pb_data, PH_EMAIL for the SFTP user.
+# phost for read-only power status; PocketBase backup API for pb_data.
 source ~/dotfiles/claude/hooks/agent-env.sh
 python3 -m collector.offline --sources awesome,selfhst,gh_trending
 bash collector/run_daily.sh
@@ -61,44 +62,44 @@ bash collector/run_weekly_sqlstage.sh  # adds gh_popular
 
 ## Transport
 
-PocketHost retired `ph_pat_` tokens on 2026-11-21 in favour of `pbt_` tokens,
-and the npm `pockethost` 4.3 CLI cannot spend them, so its `show`/`power`/`pull`/
-`upload`/`rm` surface is gone. The v5 CLI deploys code but has no power control
-and never touches `pb_data`. The transport therefore splits in two:
+The v5 PocketHost CLI deploys code only; it neither moves `pb_data` nor controls
+power. `phost status` is used only to confirm the intended instance remains ON.
+Database snapshots use the instance's PocketBase superuser from
+`PB_AUTOMATION_CREDENTIALS` via `pb-credentials`; the platform login and shared
+`pbt_` token are not used for database contents, and HP's superuser is never
+used.
 
-- **Power** goes through `phost` (mothership user auth via `PH_EMAIL`/
-  `PH_PASSWORD`).
-- **`pb_data` files** go through PocketHost SFTP on port 2222 with
-  `~/.ssh/pockethost_ed25519`, using the instance's `selfhosted/pb_data`
-  directory. The SFTP user comes from `POCKETHOST_SFTP_USER`, else `PH_EMAIL`.
-  PocketHost retires SFTP on 2027-02-06.
+The collector creates a fresh backup with `POST /api/backups`, obtains a file
+token, and downloads the ZIP. It repeats the download and compares SHA-256
+before staging. The original ZIP is retained locally and on the instance. A
+separate working copy of its `data.db` is updated and passes
+`PRAGMA integrity_check`; the ZIP is rebuilt with only that member replaced.
+`auxiliary.db` and every other member remain from the fresh backup of the same
+instance, which is required because restore replaces all of `pb_data`.
 
-`SFTPTransport` keeps the previous safety contract: the same canonical file
-name allowlist, the same credential-free mutation marker, and the same
-stopped-instance requirement. SFTP renames natively, so one logical move is a
-single server-side `rename` instead of a pull/upload/remove cycle. The
-destination must be absent and the source present before the rename runs.
+For compressed ZIPs up to 90 MiB, upload uses multipart field `file` at
+`POST /api/backups/upload`. The uploaded backup is downloaded again and its
+SHA-256 must match before `POST /api/backups/{key}/restore`. Larger ZIPs use the
+`pb-backup-stage` R2 bucket: the original and staged backups are copied directly
+to R2 and read back for hash verification. R2 credentials are placed in the
+instance's backup settings only for that transfer and are cleared and verified
+empty afterward. Existing nonempty S3 settings are never overwritten. R2
+credentials, file tokens and superuser tokens are not written to receipts or
+logs.
 
-Both runners source the existing `agent-env.sh`. A fresh run confirms ON power
-before and after collection and refuses to turn on an intentionally OFF
-instance. Recovery may restore only its recorded original ON state. Credentials
-never enter arguments, receipts or output. Incomplete receipts from the retired
-4.3 CLI transport fail with a target mismatch; completed receipts remain
-accepted. Deploying code is a separate workflow (below) and is never part of a
-data run.
+Restore restarts the PocketBase app itself; the collector never powers the
+instance off or on. It waits for `/api/health` to return 200, then takes a fresh
+backup and compares a deterministic SQLite dump hash with the staged database
+(PocketBase may rewrite SQLite pages while starting). Only then are the old
+generation checkpointed and fresh journal progress published.
 
-The staged DB passes SQLite integrity checks, uses DELETE journal mode, and is
-uploaded to a unique temporary name. A downloaded copy must match its SHA-256
-before installation. The original main DB set is renamed to retained remote
-backups; old WAL/SHM cannot attach to the new DB. Retained `.original` and
-`.rejected` copies cannot be move sources or deleted. Only canonical DB files
-and unique `.upload`/`.restore` staging files can be created. Every file read
-first confirms a stopped instance and a fresh directory listing. Another
-download/hash check verifies installation. Only then are the old generation
-checkpointed, fresh intent published and fresh progress checkpointed, using the
-API writer's durable primitives. `auxiliary.db` and all other files are
-untouched. This path never constructs a record API client or authenticates with
-PocketBase superuser credentials. `/api/health` needs no credential.
+A credential-free, fsynced mutation marker is written before each remote
+mutation, including backup creation, file-token creation, upload, restore and
+any temporary R2 settings or object write. A lost response leaves the marker
+pending and stops automatic retries or conflicting restores. Confirmed failures
+restore the original backup and verify health; original local/remote backups are
+never deleted. The receipt and marker are the recovery evidence. Code deployment
+is a separate workflow (below) and never part of a data run.
 
 ### Deploying code
 
@@ -109,36 +110,26 @@ manifest before publishing. A failed publish is reported as uncertain rather
 than retried: the remote may already have the files.
 
 `writes.json.offline.json` records the exact old/fresh plans and installation
-state for crash reconciliation. Per-run captures, original DB sets, staged DBs,
+state for crash reconciliation. Per-run captures, original backup ZIPs, staged DBs,
 hash-check copies and receipts remain under the journal's `offline/<run-id>/`
 directory (or `--backup-dir`). Receipt and capture JSON files use mode 0600 and
 run directories use 0700. No backup is deleted. Keep these artifacts private and
 retain them until the operator explicitly chooses a retention policy.
 
-Read, hash or checkpoint failures trigger restoration of the original DB set and
-journal cursor, then restart/health verification. Failed mutating transport commands
-record `uncertain` and stop automatic work: the server may still be writing, so
-no conflicting rollback or restart is attempted. A tiny credential-free
-`writes.json.sftp-mutation.json` marker is fsynced before every mutation and cleared
-only after successful acknowledgment. A process killed during a command therefore
-also requires operator reconciliation, including in a fresh process. Lost
-responses leave the retained original copies available for that reconciliation.
-Other SIGTERM interruptions enter the cleanup path. An uncatchable kill outside
-a pending mutation is reconciled from the saved receipt on the next invocation:
-verify the installed hash before publishing progress, or
-restore a partial installation. After a checkpointed installation, startup
-failure retains that installation and its progress; the next invocation retries
-startup/health before collecting fresh input. A changed installed hash or failed
-rollback fails closed for operator inspection. Network outages can prevent
-cleanup; the receipt and original copies are the recovery evidence.
-Rollback persists a restart-pending boundary only after restoring the DB and
-journal. Recovery after that boundary retries startup without replacing files,
-preserving user changes made after a successful restart. A failed journal
-restoration leaves the instance stopped.
-During clean shutdown SQLite may remove WAL/SHM after the first directory
-listing. Read-only capture retries up to three times with fresh listings and
-hash checks, retaining every attempt. No upload, rename or checkpoint occurs
-until a stable complete original set has been captured.
+Read, hash or checkpoint failures after a confirmed restore trigger a restore of
+the retained original backup and a health check before the old journal cursor is
+restored. A mutation with an unconfirmed outcome is fenced: the credential-free
+`writes.json.backup-mutation.json` marker remains pending, and no conflicting
+restore or retry is attempted until operator reconciliation. Process termination
+inside a mutation follows the same path. During rollback, a confirmed HTTP 400 may
+be retried once after health returns; recovery verifies the original logical DB.
+A later invocation verifies the logical dump before publishing progress; if it
+differs from the staged DB, recovery restores the retained original backup. After a checkpointed installation,
+startup failure keeps the installed contents and progress; recovery checks health
+before collecting fresh input. A changed logical dump, unclear mutation or failed
+rollback stops for inspection. Network outages can prevent cleanup; an uncertain
+R2 settings mutation can leave its temporary secret saved until operator
+reconciliation. The receipt, local ZIP and remote backups are the recovery evidence.
 
 Local dry runs require a synthetic DB and a captured JSON object containing
 `date`, `requested_sources`, and `rows` (RawApp dictionaries). They never fetch,
@@ -150,12 +141,13 @@ netless python3 -m collector.offline --dry-run --db /path/to/fixture/data.db \
   --from-collected /path/to/captured.json --state-file /path/to/test-writes.json
 ```
 
-The orchestration transport exposes bounded file probes/download/upload/logical
-moves plus stop/start/health. API-key provisioning, runtime PATH/environment,
-timer enablement and live installation are separate operator actions. The daily service should allow
-1800 seconds to start and 300 seconds for termination cleanup; source collection
-happens before the downtime window. Serialize any other host or writer using a
-different journal path.
+The Backups API transport exposes backup creation, download, upload, restore and
+health checks; it never controls instance power. Per-instance credential
+provisioning, runtime PATH/environment, timer enablement and live installation
+are separate operator actions. The daily service should allow 1800 seconds to
+start and 300 seconds for termination cleanup; collection and staging happen
+while the app is online, and restore restarts it. Serialize any other host or
+writer using a different journal path.
 
 ## Optional API collector
 

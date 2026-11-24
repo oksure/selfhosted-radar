@@ -118,7 +118,7 @@ def run(setup, names=O.DAILY, n=1, **kwargs):
     assert remote.on  # Capture must precede downtime, including pending replay.
     remote.call('collect', tuple(scope))
     return rows(scope, n)
-  return O.run(remote, state, collect, names, TODAY, BASE, **kwargs)
+  return O._run_sftp_legacy(remote, state, collect, names, TODAY, BASE, **kwargs)
 
 
 def saved(state):
@@ -275,7 +275,9 @@ def test_unstable_capture_stops_after_three_attempts_without_installing(setup):
 def test_sigterm_during_capture_does_not_retry_or_publish(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'SFTPTransport', lambda: remote)
+  from collector import pockethost_backup
+  monkeypatch.setattr(pockethost_backup, 'BackupAPITransport', lambda: remote)
+  monkeypatch.setattr(O, 'run', O._run_sftp_legacy)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   def terminate(kind, *args):
@@ -390,7 +392,7 @@ def test_offline_cap_exceeds_api_200_and_insufficient_cap_fails_safely(setup):
 
 def test_empty_requested_adapter_still_records_fresh_scope(setup):
   db, state, remote = setup
-  result = O.run(remote, state, lambda names: [], (*O.DAILY, 'gh_popular'), TODAY, BASE)
+  result = O._run_sftp_legacy(remote, state, lambda names: [], (*O.DAILY, 'gh_popular'), TODAY, BASE)
   assert result['success'] and saved(state)['requested_sources'] == sorted((*O.DAILY, 'gh_popular'))
 
 
@@ -414,7 +416,9 @@ def test_journal_lock_excludes_capture_and_downtime(setup):
 def test_sigterm_during_install_rolls_back_restarts_and_exits_failure(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'SFTPTransport', lambda: remote)
+  from collector import pockethost_backup
+  monkeypatch.setattr(pockethost_backup, 'BackupAPITransport', lambda: remote)
+  monkeypatch.setattr(O, 'run', O._run_sftp_legacy)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   sent = []
@@ -442,7 +446,9 @@ def test_runners_preserve_daily_weekly_scope():
 def test_sigterm_at_startup_retries_start_without_rolling_back(setup, monkeypatch, capsys):
   db, state, remote = setup
   original = remote.data['data.db']
-  monkeypatch.setattr(O, 'SFTPTransport', lambda: remote)
+  from collector import pockethost_backup
+  monkeypatch.setattr(pockethost_backup, 'BackupAPITransport', lambda: remote)
+  monkeypatch.setattr(O, 'run', O._run_sftp_legacy)
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   sent = []
@@ -475,18 +481,19 @@ def test_health_uses_existing_pockethost_user_agent(monkeypatch):
   assert O.SFTPTransport().health()
 
 
-def test_default_destination_uses_the_phost_sftp_transport(setup, monkeypatch, capsys):
-  db, state, remote = setup
+def test_default_destination_uses_the_backups_api_transport(setup, monkeypatch, capsys):
+  _, state, _ = setup
   destinations = []
+  from collector import pockethost_backup
   def transport():
-    destinations.append('phost-sftp')
-    return remote
-  monkeypatch.setenv('POCKETHOST_SFTP_USER', 'fixture')
-  monkeypatch.setattr(O, 'SFTPTransport', transport)
+    destinations.append('pb-backups-api')
+    return object()
+  monkeypatch.setattr(pockethost_backup, 'BackupAPITransport', transport)
+  monkeypatch.setattr(O, 'run', lambda *args, **kwargs: {'success': True})
   from collector import sync
   monkeypatch.setattr(sync, 'collect', lambda names: rows(names))
   assert O.main(['--state-file', str(state)]) == 0
-  assert destinations == ['phost-sftp']
+  assert destinations == ['pb-backups-api']
   assert json.loads(capsys.readouterr().out)['success']
 
 

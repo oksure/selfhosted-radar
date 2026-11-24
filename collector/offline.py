@@ -1,8 +1,10 @@
 """Offline bulk publication with exact journal replay and a crash receipt.
 
-Only main-DB files cross the transport seam; no PocketBase record client is used.
+A full PocketBase backup crosses the transport seam; only ``data.db`` is changed
+for publication. No PocketBase record client is used.
 """
 import argparse
+import copy
 from datetime import date
 import hashlib
 import json
@@ -15,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import zipfile
 from types import SimpleNamespace
 import urllib.request
 import uuid
@@ -34,6 +37,10 @@ class Interrupted(RuntimeError):
 
 class MutationUncertain(RuntimeError):
   """A server mutation may still be running; automatic recovery is unsafe."""
+
+
+class DBContentMismatch(RuntimeError):
+  """A backup confirms that the remote database differs from the expected state."""
 
 
 class ReceiptTargetMismatch(RuntimeError):
@@ -470,9 +477,9 @@ def _recover_known(transport, path, receipt, base):
     _abort(transport, path, receipt)
 
 
-def run(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
-        max_writes=100000, backup_dir=None):
-  """Recover, collect online, then install pending + freshly planned operations."""
+def _run_sftp_legacy(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
+                     max_writes=100000, backup_dir=None):
+  """Retired SFTP implementation retained only for historical receipt parsing."""
   path = W.state_path(SimpleNamespace(base=base), state_file)
   today = today or date.today().isoformat()
   names = sorted(set(names))
@@ -543,6 +550,288 @@ def run(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
             'receipt': str(rp), 'backup': str(directory)}
 
 
+def _backup_db(archive, destination):
+  """Extract exactly one safe root data.db from a PocketBase backup ZIP."""
+  destination = Path(destination)
+  destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  with zipfile.ZipFile(archive) as src:
+    infos = src.infolist()
+    names = [info.filename for info in infos]
+    if len(names) != len(set(names)) or src.testzip() is not None:
+      raise RuntimeError('backup ZIP has duplicate or corrupt members')
+    for info in infos:
+      parts = PurePosixPath(info.filename).parts
+      if (info.filename.startswith('/') or '\\' in info.filename or '..' in parts
+          or (info.external_attr >> 16) & 0o170000 == 0o120000):
+        raise RuntimeError('backup ZIP contains an unsafe member')
+    matches = [info for info in infos if info.filename == 'data.db']
+    if len(matches) != 1:
+      raise RuntimeError('backup ZIP must contain exactly one root data.db')
+    with src.open(matches[0]) as data, destination.open('xb') as out:
+      shutil.copyfileobj(data, out, 1 << 20)
+      out.flush()
+      os.fsync(out.fileno())
+  with sqlite3.connect(destination.resolve().as_uri() + '?mode=ro&immutable=1', uri=True) as db:
+    if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+      raise RuntimeError('backup database integrity check failed')
+  return destination
+
+
+def _replace_backup_db(archive, staged_db, destination):
+  """Prepare a fresh same-instance backup with only data.db replaced."""
+  with zipfile.ZipFile(archive) as src, zipfile.ZipFile(destination, 'x') as dst:
+    dst.comment = src.comment
+    infos = src.infolist()
+    names = [info.filename for info in infos]
+    if len(names) != len(set(names)) or 'data.db' not in names or src.testzip() is not None:
+      raise RuntimeError('source backup ZIP is invalid or lacks data.db')
+    replaced = 0
+    for info in infos:
+      parts = PurePosixPath(info.filename).parts
+      if (info.filename.startswith('/') or '\\' in info.filename or '..' in parts
+          or (info.external_attr >> 16) & 0o170000 == 0o120000):
+        raise RuntimeError('source backup ZIP contains an unsafe member')
+      clone = copy.copy(info)
+      with dst.open(clone, 'w') as out:
+        if info.filename == 'data.db':
+          with Path(staged_db).open('rb') as data:
+            shutil.copyfileobj(data, out, 1 << 20)
+          replaced += 1
+        else:
+          with src.open(info) as data:
+            shutil.copyfileobj(data, out, 1 << 20)
+    if replaced != 1:
+      raise RuntimeError('source backup ZIP data.db is ambiguous')
+  if not zipfile.is_zipfile(destination):
+    raise RuntimeError('prepared backup ZIP failed validation')
+  with zipfile.ZipFile(destination) as archive_file:
+    if archive_file.testzip() is not None:
+      raise RuntimeError('prepared backup ZIP has a CRC error')
+
+
+def _logical_db_digest(path):
+  """Hash a deterministic SQLite dump so PocketBase startup page rewrites do not false-fail."""
+  uri = Path(path).resolve().as_uri() + '?mode=ro&immutable=1'
+  digestor = hashlib.sha256()
+  with sqlite3.connect(uri, uri=True) as db:
+    for line in db.iterdump():
+      digestor.update(line.encode('utf-8') + b'\n')
+  return digestor.hexdigest()
+
+
+def _fresh_snapshot(transport, directory, name):
+  key = transport.create_backup(name)
+  local = transport.download(key, directory / (name + '.zip'))
+  repeated = transport.download(key, directory / (name + '.repeat.zip'))
+  expected = digest(local)
+  if digest(repeated) != expected:
+    raise RuntimeError('backup download hash mismatch')
+  return key, local, expected
+
+
+def _verify_current_db(transport, directory, name, expected):
+  _, snapshot, _ = _fresh_snapshot(transport, directory, name)
+  data_db = _backup_db(snapshot, directory / (name + '-data.db'))
+  if _logical_db_digest(data_db) != expected:
+    raise DBContentMismatch('restored database contents do not match the expected state')
+
+
+def _rollback_backup(transport, directory, receipt):
+  original_key = receipt.get('original_backup_key')
+  if not original_key:
+    raise RuntimeError('original remote backup key is missing')
+  attempts = receipt.get('rollback_restore_attempts', 0)
+  while True:
+    if attempts >= 2:
+      raise RuntimeError('original backup restore retry limit reached')
+    attempts += 1
+    receipt['rollback_restore_attempts'] = attempts
+    _record(Path(receipt['state_file']), receipt, 'rolling_back')
+    try:
+      transport.restore(original_key)
+    except W.PBError as exc:
+      receipt['rollback_restore_status'] = exc.status
+      _record(Path(receipt['state_file']), receipt, 'rolling_back')
+      if exc.status != 400 or attempts >= 2 or not transport.wait_healthy():
+        raise
+      # PocketBase can reject a restore while the preceding restore is restarting.
+      continue
+    receipt['rollback_restore_confirmed'] = True
+    receipt.pop('rollback_restore_status', None)
+    _record(Path(receipt['state_file']), receipt, 'rolling_back')
+    break
+  if not transport.wait_healthy():
+    raise RuntimeError('original backup restore did not become healthy')
+  _verify_current_db(transport, directory, 'radar-' + receipt['id'] + '-rollback-check.zip',
+                     receipt['original_db_content_sha256'])
+  _record(Path(receipt['state_file']), receipt, 'rolled_back')
+  _restore_intent(Path(receipt['state_file']), receipt)
+  _record(Path(receipt['state_file']), receipt, 'aborted')
+
+
+def _recover_backup_api(transport, path, receipt, base):
+  phase = receipt.get('phase')
+  if phase in ('complete', 'aborted'):
+    return
+  if receipt.get('target') != base or receipt.get('transport') != transport.identity:
+    raise ReceiptTargetMismatch('offline receipt target mismatch')
+  if phase == 'uncertain' or transport.uncertain:
+    raise MutationUncertain('PocketBase mutation outcome uncertain; operator reconciliation required')
+  if phase in ('capturing', 'backed_up', 'staged'):
+    _restore_intent(path, receipt)
+    _record(path, receipt, 'aborted')
+    return
+  if phase == 'rolling_back':
+    attempts = receipt.get('rollback_restore_attempts', 0)
+    if type(attempts) is not int or attempts < 0:
+      raise RuntimeError('invalid rollback restore attempt count')
+    retry = (not receipt.get('rollback_restore_confirmed') and attempts < 2
+             and getattr(transport, 'rollback_retryable', lambda key: False)(
+               receipt.get('original_backup_key')))
+    if not transport.wait_healthy():
+      raise RuntimeError('original backup rollback is awaiting health recovery')
+    try:
+      _verify_current_db(transport, Path(receipt['directory']),
+                         'radar-' + receipt['id'] + '-rollback-recovery-check.zip',
+                         receipt['original_db_content_sha256'])
+    except MutationUncertain:
+      raise
+    except DBContentMismatch:
+      if retry:
+        _rollback_backup(transport, Path(receipt['directory']), receipt)
+        return
+      raise RuntimeError('original backup rollback does not match the retained DB; manual reconciliation required') from None
+    except Exception:
+      raise RuntimeError('original backup rollback verification did not complete') from None
+    _record(path, receipt, 'rolled_back')
+    phase = 'rolled_back'
+  if phase == 'rolled_back':
+    _restore_intent(path, receipt)
+    _record(path, receipt, 'aborted')
+    return
+  if phase not in ('installing', 'installed', 'checkpointed'):
+    raise RuntimeError('offline receipt phase requires manual reconciliation')
+  try:
+    if not transport.wait_healthy():
+      raise RuntimeError('instance health is not confirmed')
+    _verify_current_db(transport, Path(receipt['directory']),
+                       'radar-' + receipt['id'] + '-recovery-check.zip',
+                       receipt['installed_content_sha256'])
+  except Exception:
+    if transport.uncertain:
+      raise MutationUncertain('recovery mutation outcome uncertain; operator reconciliation required') from None
+    _rollback_backup(transport, Path(receipt['directory']), receipt)
+    return
+  if phase != 'checkpointed':
+    _record(path, receipt, 'installed')
+    _checkpoint(path, receipt, base)
+  _record(path, receipt, 'complete')
+
+
+def run(transport, state_file, collect_rows, names=DAILY, today=None, base=BASE,
+        max_writes=100000, backup_dir=None):
+  """Stage from a retained API backup and restore it without powering off."""
+  path = W.state_path(SimpleNamespace(base=base), state_file)
+  today = today or date.today().isoformat()
+  names = sorted(set(names))
+  date.fromisoformat(today)
+  if not names or set(names) - set(sources.ADAPTERS) or max_writes <= 0:
+    raise ValueError('invalid offline scope or cap')
+  with W._lock(path):
+    transport.configure(path)
+    rp = _receipt_path(path)
+    if rp.exists():
+      _recover_backup_api(transport, path, json.loads(rp.read_text()), base)
+      if getattr(transport, 'r2_active', False):
+        transport.clear_r2()
+    old = W._load(path, SimpleNamespace(base=base))
+    if not transport.is_on():
+      raise RuntimeError('instance was intentionally off; refusing scheduled publication')
+    rows = list(collect_rows(names))
+    if any(row.source not in names for row in rows):
+      raise ValueError('captured source outside requested scope')
+    if not transport.is_on():
+      raise RuntimeError('instance powered off during collection; refusing publication')
+    run_id = uuid.uuid4().hex
+    directory = Path(backup_dir or path.parent / 'offline').resolve() / run_id
+    directory.mkdir(parents=True, mode=0o700)
+    W._save(directory / 'collected.json', {'requested_sources': names, 'date': today,
+            'rows': [vars(row) for row in rows]})
+    receipt = {'version': 2, 'id': run_id, 'target': base, 'transport': transport.identity,
+               'directory': str(directory), 'state_file': str(path), 'old_journal': old,
+               'fresh_journal': None, 'original_power': True, 'requested_sources': names,
+               'date': today}
+    _record(path, receipt, 'capturing')
+    try:
+      original_key, original_zip, original_zip_sha = _fresh_snapshot(
+        transport, directory, 'radar-' + run_id + '-original.zip')
+      original_db = _backup_db(original_zip, directory / 'original-data.db')
+      receipt.update(original_backup_key=original_key, original_zip_sha256=original_zip_sha,
+                     original_db_sha256=digest(original_db),
+                     original_db_content_sha256=_logical_db_digest(original_db))
+      _record(path, receipt, 'backed_up')
+      stage = directory / 'staged.db'
+      _copy_db(original_db, stage)
+      fresh, applied = _prepare(stage, old, rows, names, today, base, max_writes)
+      staged_zip = directory / 'staged-backup.zip'
+      _replace_backup_db(original_zip, stage, staged_zip)
+      receipt.update(fresh_journal=fresh, applied=applied, installed_sha256=digest(stage),
+                     installed_content_sha256=_logical_db_digest(stage),
+                     staged_zip_sha256=digest(staged_zip))
+      _record(path, receipt, 'staged')
+      if staged_zip.stat().st_size > transport.upload_cap:
+        transport.enable_r2(original_key, original_zip, directory)
+      staged_key = transport.upload_backup(staged_zip, 'radar-' + run_id + '-staged.zip')
+      upload_check = transport.download(staged_key, directory / 'upload-check.zip')
+      if digest(upload_check) != receipt['staged_zip_sha256']:
+        raise RuntimeError('uploaded backup hash mismatch')
+      receipt['staged_backup_key'] = staged_key
+      _record(path, receipt, 'installing')
+      transport.restore(staged_key)
+      if not transport.wait_healthy():
+        raise RuntimeError('restored instance health check failed')
+      if not transport.is_on():
+        raise RuntimeError('instance power state changed during backup restore')
+      _verify_current_db(transport, directory, 'radar-' + run_id + '-installed-check.zip',
+                         receipt['installed_content_sha256'])
+      if getattr(transport, 'r2_active', False):
+        transport.clear_r2()
+      _record(path, receipt, 'installed')
+      _checkpoint(path, receipt, base)
+      _record(path, receipt, 'complete')
+      return {'success': True, 'installed': True, 'healthy': True, 'fresh_scope': names,
+              'generation': fresh['generation'], 'date': today, 'applied': applied,
+              'receipt': str(rp), 'backup': str(directory), 'original_backup': original_key}
+    except BaseException:
+      if transport.uncertain:
+        _record(path, receipt, 'uncertain')
+      elif receipt.get('phase') in ('installing', 'installed', 'checkpointed'):
+        try:
+          _rollback_backup(transport, directory, receipt)
+          if getattr(transport, 'r2_active', False):
+            transport.clear_r2()
+        except BaseException:
+          if transport.uncertain:
+            _record(path, receipt, 'uncertain')
+            raise MutationUncertain('rollback or R2 cleanup outcome uncertain; inspect retained backups') from None
+          if receipt.get('phase') in ('rolling_back', 'rolled_back'):
+            raise RuntimeError('original backup rollback is awaiting health or journal recovery') from None
+          if receipt.get('phase') == 'aborted' and getattr(transport, 'r2_active', False):
+            raise RuntimeError('rollback completed; temporary R2 settings still need cleanup') from None
+          _record(path, receipt, 'uncertain')
+          raise MutationUncertain('rollback reconciliation failed; inspect retained backups') from None
+      else:
+        if getattr(transport, 'r2_active', False):
+          try:
+            transport.clear_r2()
+          except BaseException:
+            _record(path, receipt, 'uncertain')
+            raise MutationUncertain('temporary R2 credentials could not be cleared') from None
+        _restore_intent(path, receipt)
+        _record(path, receipt, 'aborted')
+      raise
+
+
 def dry_run(db_path, state_file, rows, names, today, directory, max_writes=100000, base=BASE):
   """Local fixtures only; no remote transport or journal publication."""
   path = W.state_path(SimpleNamespace(base=base), state_file)
@@ -600,7 +889,8 @@ def main(argv=None):
         result = dry_run(args.db, args.state_file, collect_rows(names), names, args.today,
                          directory, args.max_writes)
     else:
-      result = run(SFTPTransport(), args.state_file, collect_rows,
+      from .pockethost_backup import BackupAPITransport
+      result = run(BackupAPITransport(), args.state_file, collect_rows,
                    names, args.today, max_writes=args.max_writes, backup_dir=args.backup_dir)
     print(json.dumps(result))
     return 0

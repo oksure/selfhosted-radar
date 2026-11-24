@@ -265,7 +265,7 @@ def prepare_run(cli, tmp_path):
 
 
 def publish(transport, state):
-  return O.run(transport, state, lambda scope: rows(scope), O.DAILY, TODAY, BASE)
+  return O._run_sftp_legacy(transport, state, lambda scope: rows(scope), O.DAILY, TODAY, BASE)
 
 
 def test_overall_run(cli, tmp_path):
