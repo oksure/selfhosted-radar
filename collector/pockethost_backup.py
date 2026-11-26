@@ -21,6 +21,19 @@ R2_ENDPOINT = 'https://4d0bb8ab7e61809c181b815854ecd8d8.r2.cloudflarestorage.com
 R2_BUCKET = 'pb-backup-stage'
 INSTANCE_IDS = {'selfhosted': '2sb1xkspblek1f5', 'bkptest': '5kvbuh7ntjbz6la'}
 _KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.zip\Z')
+_S3_EMPTY = {'enabled': False, 'endpoint': '', 'region': '', 'bucket': '',
+             'accessKey': '', 'secret': '', 'forcePathStyle': False}
+
+
+def _s3_is_empty(s3):
+  # PocketBase masks secrets in GET /api/settings (the key is omitted on every
+  # instance), so an omitted secret is normal; a returned non-empty one is not.
+  if not isinstance(s3, dict):
+    return False
+  visible = dict(s3)
+  if 'secret' not in visible:
+    visible['secret'] = ''
+  return visible == _S3_EMPTY
 
 
 class APIError(RuntimeError):
@@ -83,9 +96,7 @@ class BackupAPITransport:
         raise RuntimeError('unexpected backup S3 settings require operator review')
       self.r2_active = True
     elif s3['enabled'] is False:
-      empty = {'enabled': False, 'endpoint': '', 'region': '', 'bucket': '',
-               'accessKey': '', 'secret': '', 'forcePathStyle': False}
-      if s3 != empty:
+      if not _s3_is_empty(s3):
         raise RuntimeError('inactive backup S3 settings are nonempty or unverifiable; operator review required')
     else:
       raise RuntimeError('backup S3 enabled state could not be inspected; operator review required')
@@ -276,14 +287,12 @@ class BackupAPITransport:
   def clear_r2(self):
     if not self.r2_active:
       return
-    empty = {'enabled': False, 'endpoint': '', 'region': '', 'bucket': '',
-             'accessKey': '', 'secret': '', 'forcePathStyle': False}
     self._mark('clear-temporary-r2',
-               lambda: self.api._req('PATCH', '/api/settings', {'backups': {'s3': empty}}))
+               lambda: self.api._req('PATCH', '/api/settings', {'backups': {'s3': dict(_S3_EMPTY)}}))
     response = self.api._req('GET', '/api/settings')
     backups = response.get('backups') if isinstance(response, dict) else None
     settings = backups.get('s3') if isinstance(backups, dict) else None
-    if not isinstance(settings, dict) or settings != empty:
+    if not _s3_is_empty(settings):
       raise APIError('temporary R2 settings could not be verified cleared')
     self.r2_active = False
 

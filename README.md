@@ -84,9 +84,12 @@ SHA-256 must match before `POST /api/backups/{key}/restore`. Larger ZIPs use the
 to R2 and read back for hash verification. R2 credentials are placed in the
 instance's backup settings only for that transfer and are cleared and verified
 empty afterward. Existing nonempty S3 settings are never overwritten. Missing
-or unreadable S3 settings, a missing/non-boolean `enabled` field, or an omitted
-`secret` field are not treated as disabled/empty; cleanup remains unverified and
-the next collection stops for operator reconciliation. R2 credentials, file
+or unreadable S3 settings, a missing/non-boolean `enabled` field, or any other
+nonempty field are not treated as disabled/empty; cleanup remains unverified and
+the next collection stops for operator reconciliation. PocketBase never returns
+`secret` from `GET /api/settings` (checked on three instances, 2026-11-26), so an
+omitted `secret` counts as empty; cleanup writes it as `""` explicitly and a
+returned non-empty `secret` still stops the run. R2 credentials, file
 tokens and superuser tokens are not written to receipts or logs.
 
 Restore restarts the PocketBase app itself; the collector never powers the

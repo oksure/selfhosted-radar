@@ -409,14 +409,27 @@ def test_configure_rejects_secret_left_in_disabled_r2_settings(monkeypatch, tmp_
   assert not transport.r2_active
 
 
-def test_configure_rejects_unreadable_secret_in_disabled_r2_settings(monkeypatch, tmp_path):
+def test_configure_accepts_masked_secret_in_disabled_r2_settings(monkeypatch, tmp_path):
+  # PocketBase omits secrets from GET /api/settings on every instance (2026-11-26).
   db = tmp_path / 'seed.db'
   make_db(db, 'stable')
   archive = make_zip(tmp_path / 'seed.zip', db)
   transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
   api.omit_secret_on_get = True
 
-  with pytest.raises(RuntimeError, match='unverifiable'):
+  transport.configure(tmp_path / 'state.json')
+  assert not transport.r2_active
+
+
+def test_configure_rejects_masked_secret_with_other_residue(monkeypatch, tmp_path):
+  db = tmp_path / 'seed.db'
+  make_db(db, 'stable')
+  archive = make_zip(tmp_path / 'seed.zip', db)
+  transport, api, _ = make_transport(monkeypatch, tmp_path, archive.read_bytes())
+  api.omit_secret_on_get = True
+  api.settings['backups']['s3']['accessKey'] = 'left-over'
+
+  with pytest.raises(RuntimeError, match='nonempty or unverifiable'):
     transport.configure(tmp_path / 'state.json')
   assert not transport.r2_active
 
@@ -489,7 +502,7 @@ def test_r2_clear_fails_if_the_remote_secret_remains(monkeypatch, tmp_path):
   assert json.loads(transport._marker.read_text())['pending'] is False
 
 
-def test_r2_clear_fails_if_remote_secret_is_not_readable(monkeypatch, tmp_path):
+def test_r2_clear_accepts_masked_secret_after_clearing(monkeypatch, tmp_path):
   db = tmp_path / 'seed.db'
   make_db(db, 'stable')
   archive = make_zip(tmp_path / 'seed.zip', db)
@@ -498,9 +511,9 @@ def test_r2_clear_fails_if_remote_secret_is_not_readable(monkeypatch, tmp_path):
     'AWS_ACCESS_KEY_ID': 'fixture-access', 'AWS_SECRET_ACCESS_KEY': 'fixture-secret'})
   transport.configure_r2()
   api.omit_secret_on_get = True
-  with pytest.raises(P.APIError, match='could not be verified cleared'):
-    transport.clear_r2()
-  assert transport.r2_active
+  transport.clear_r2()
+  assert not transport.r2_active
+  assert api.settings['backups']['s3']['secret'] == ''
   assert json.loads(transport._marker.read_text())['pending'] is False
 
 
